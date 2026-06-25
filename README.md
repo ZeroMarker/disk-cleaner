@@ -55,7 +55,8 @@ Cache cleanup uses native commands where available, falling back to directory de
 
 | Category | Tools | Cleanup Method |
 |----------|-------|----------------|
-| **Node.js** | npm, pnpm, yarn, bun, deno | native command |
+| **Node.js** | npm, pnpm, yarn, bun | native command |
+| **Node.js** | deno | directory |
 | **Python** | pip, poetry, conda, pdm, uv | native command |
 | **Rust** | cargo | directory |
 | **Go** | go | native command (`go clean`) |
