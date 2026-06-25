@@ -8,7 +8,10 @@ use colored::Colorize;
 use walkdir::WalkDir;
 
 #[derive(Parser)]
-#[command(name = "disk-cleaner", about = "A fast disk cleanup tool written in Rust")]
+#[command(
+    name = "disk-cleaner",
+    about = "A fast disk cleanup tool written in Rust"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -58,6 +61,7 @@ fn is_junk(path: &Path) -> Option<String> {
         ".DS_Store" | "Thumbs.db" | "desktop.ini" => Some("system".into()),
         _ => match ext {
             "tmp" | "temp" | "swp" | "swo" | "bak" | "log" => Some("temp/log".into()),
+            "cargo" | "gradle" | "hex" | "vcpkg" | "snap" | "pacman" | "winget" => None,
             _ => None,
         },
     }
@@ -122,17 +126,17 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             let git = home.join(".cargo").join("git");
             let mut dirs = Vec::new();
             if registry.exists() {
-                dirs.push((registry, "cargo registry".into()));
+                dirs.push((registry, "cargo crate source cache".into()));
             }
             if git.exists() {
-                dirs.push((git, "cargo git".into()));
+                dirs.push((git, "cargo git source cache".into()));
             }
             dirs
         }
         "journalctl" => {
             let log_dir = PathBuf::from("/var/log/journal");
             if log_dir.exists() {
-                vec![(log_dir, "journalctl logs".into())]
+                vec![(log_dir, "journalctl".into())]
             } else {
                 vec![]
             }
@@ -169,16 +173,12 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "mise" => {
-            let data = home.join(".local").join("share").join("mise");
             let cache = home.join(".cache").join("mise");
-            let mut dirs = Vec::new();
             if cache.exists() {
-                dirs.push((cache, "mise cache".into()));
+                vec![(cache, "mise cache".into())]
+            } else {
+                vec![]
             }
-            if data.exists() {
-                dirs.push((data, "mise data".into()));
-            }
-            dirs
         }
         "brew" => {
             let mut dirs = Vec::new();
@@ -250,7 +250,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
         "maven" => {
             let cache = home.join(".m2").join("repository");
             if cache.exists() {
-                vec![(cache, "maven repo".into())]
+                vec![(cache, "maven dependency cache".into())]
             } else {
                 vec![]
             }
@@ -304,9 +304,15 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "docker" => {
-            let root = PathBuf::from("/var/lib/docker");
-            if root.exists() {
-                vec![(root, "docker data".into())]
+            if Command::new("docker")
+                .args(["info"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                vec![(PathBuf::from("/var/lib/docker"), "docker".into())]
             } else {
                 vec![]
             }
@@ -336,12 +342,15 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "vcpkg" => {
-            let cache = PathBuf::from("/usr/local/share/vcpkg");
-            if cache.exists() {
-                vec![(cache, "vcpkg".into())]
-            } else {
-                vec![]
+            let root = PathBuf::from("/usr/local/share/vcpkg");
+            let mut dirs = Vec::new();
+            for subdir in &["buildtrees", "downloads", "packages"] {
+                let cache = root.join(subdir);
+                if cache.exists() {
+                    dirs.push((cache, format!("vcpkg {}", subdir)));
+                }
             }
+            dirs
         }
         "zypper" => {
             let cache = PathBuf::from("/var/cache/zypper");
@@ -399,34 +408,79 @@ fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
     Ok(junk)
 }
 
-fn clean_journalctl(dry_run: bool) -> Result<u64> {
+fn get_clean_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
+    match tool {
+        "npm" => Some(("npm", vec!["cache", "clean", "--force"])),
+        "pnpm" => Some(("pnpm", vec!["store", "prune"])),
+        "yarn" => Some(("yarn", vec!["cache", "clean"])),
+        "bun" => Some(("bun", vec!["pm", "cache", "rm"])),
+        "deno" => Some(("deno", vec!["clean"])),
+        "go" => Some(("go", vec!["clean", "-cache", "-modcache"])),
+        "pip" => Some(("pip", vec!["cache", "purge"])),
+        "poetry" => Some(("poetry", vec!["cache", "clear", "--all", "."])),
+        "conda" => Some(("conda", vec!["clean", "--all", "-y"])),
+        "pdm" => Some(("pdm", vec!["cache", "clear"])),
+        "gem" => Some(("gem", vec!["cleanup"])),
+        "composer" => Some(("composer", vec!["clear-cache"])),
+        "maven" => Some(("mvn", vec!["dependency:purge-local-repository"])),
+        "pub" => Some(("dart", vec!["pub", "cache", "clean"])),
+        "nuget" => Some(("dotnet", vec!["nuget", "locals", "all", "--clear"])),
+        "apt" => Some(("apt-get", vec!["clean"])),
+        "brew" => Some(("brew", vec!["cleanup", "--cache"])),
+        "mise" => Some(("mise", vec!["cache", "clear"])),
+        "dnf" => Some(("dnf", vec!["clean", "all"])),
+        "zypper" => Some(("zypper", vec!["clean"])),
+        "flatpak" => Some(("flatpak", vec!["uninstall", "--unused"])),
+        "journalctl" => Some(("journalctl", vec!["--vacuum-time=3d"])),
+        "docker" => Some(("docker", vec!["system", "prune", "-f"])),
+        "uv" => Some(("uv", vec!["cache", "clean"])),
+        _ => None,
+    }
+}
+
+fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<()> {
+    let Some((cmd, args)) = get_clean_cmd(tool) else {
+        return Ok(());
+    };
     if dry_run {
-        println!("  {} journalctl --vacuum-time=3d", "[dry-run]".yellow());
-        return Ok(0);
+        println!("  {} {} {}", "[dry-run]".yellow(), cmd, args.join(" "));
+        return Ok(());
     }
-    let output = Command::new("journalctl")
-        .args(["--vacuum-time=3d"])
-        .output()?;
+    let output = Command::new(cmd).args(&args).output()?;
     if output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        for line in stderr.lines() {
-            println!("  {}", line.dimmed());
+        let out = String::from_utf8_lossy(&output.stderr);
+        if out.is_empty() {
+            let out = String::from_utf8_lossy(&output.stdout);
+            for line in out.lines() {
+                println!("  {}", line.dimmed());
+            }
+        } else {
+            for line in out.lines() {
+                println!("  {}", line.dimmed());
+            }
         }
-        Ok(0)
     } else {
+        let err = String::from_utf8_lossy(&output.stderr);
         println!(
-            "  {} journalctl cleanup failed (need sudo?)",
-            "failed".red()
+            "  {} {} {} ({})",
+            "failed".red(),
+            cmd,
+            args.join(" "),
+            err.trim()
         );
-        Ok(0)
     }
+    Ok(())
 }
 
 fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
     let mut cleaned = 0u64;
+    let mut cmd_cleaned = std::collections::HashSet::new();
     for item in junk {
-        if item.category == "journalctl logs" {
-            cleaned += clean_journalctl(dry_run)?;
+        let tool = item.category.split_whitespace().next().unwrap_or("");
+        if get_clean_cmd(tool).is_some() {
+            if cmd_cleaned.insert(tool.to_string()) {
+                run_clean_cmd(tool, dry_run)?;
+            }
             continue;
         }
         if dry_run {
