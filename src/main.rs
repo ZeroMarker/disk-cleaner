@@ -137,6 +137,61 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 vec![]
             }
         }
+        "apt" => {
+            let archives = PathBuf::from("/var/cache/apt/archives");
+            let lists = PathBuf::from("/var/lib/apt/lists");
+            let mut dirs = Vec::new();
+            if archives.exists() {
+                dirs.push((archives, "apt archives".into()));
+            }
+            if lists.exists() {
+                dirs.push((lists, "apt lists".into()));
+            }
+            dirs
+        }
+        "snap" => {
+            let cache_dir = PathBuf::from("/var/lib/snapd/cache");
+            let mut dirs = Vec::new();
+            if cache_dir.exists() {
+                dirs.push((cache_dir, "snap cache".into()));
+            }
+            dirs
+        }
+        "winget" => {
+            let local = std::env::var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            let cache = local.join("Microsoft/WinGet/Packages");
+            if cache.exists() {
+                vec![(cache, "winget cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "mise" => {
+            let data = home.join(".local").join("share").join("mise");
+            let cache = home.join(".cache").join("mise");
+            let mut dirs = Vec::new();
+            if cache.exists() {
+                dirs.push((cache, "mise cache".into()));
+            }
+            if data.exists() {
+                dirs.push((data, "mise data".into()));
+            }
+            dirs
+        }
+        "brew" => {
+            let mut dirs = Vec::new();
+            let linux_cache = PathBuf::from("/home/linuxbrew/.cache/Homebrew");
+            let mac_cache = home.join("Library/Caches/Homebrew");
+            if linux_cache.exists() {
+                dirs.push((linux_cache, "brew cache".into()));
+            }
+            if mac_cache.exists() {
+                dirs.push((mac_cache, "brew cache".into()));
+            }
+            dirs
+        }
         _ => vec![],
     }
 }
@@ -367,6 +422,10 @@ fn main() -> Result<()> {
                     "npm".into(),
                     "cargo".into(),
                     "journalctl".into(),
+                    "apt".into(),
+                    "snap".into(),
+                    "mise".into(),
+                    "brew".into(),
                 ],
             };
 
