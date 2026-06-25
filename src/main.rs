@@ -192,6 +192,189 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
             dirs
         }
+        "pip" => {
+            let cache = home.join(".cache").join("pip");
+            if cache.exists() {
+                vec![(cache, "pip cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "poetry" => {
+            let cache = home.join(".cache").join("pypoetry");
+            if cache.exists() {
+                vec![(cache, "poetry cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "conda" => {
+            let cache = home.join(".conda").join("pkgs");
+            if cache.exists() {
+                vec![(cache, "conda pkgs".into())]
+            } else {
+                vec![]
+            }
+        }
+        "pdm" => {
+            let cache = home.join(".cache").join("pdm");
+            if cache.exists() {
+                vec![(cache, "pdm cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "go" => {
+            let gopath = std::env::var("GOPATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home.join("go"));
+            let cache = home.join(".cache").join("go-build");
+            let mod_cache = gopath.join("pkg").join("mod");
+            let mut dirs = Vec::new();
+            if cache.exists() {
+                dirs.push((cache, "go build cache".into()));
+            }
+            if mod_cache.exists() {
+                dirs.push((mod_cache, "go mod cache".into()));
+            }
+            dirs
+        }
+        "gem" => {
+            let cache = home.join(".gem").join("cache");
+            if cache.exists() {
+                vec![(cache, "gem cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "maven" => {
+            let cache = home.join(".m2").join("repository");
+            if cache.exists() {
+                vec![(cache, "maven repo".into())]
+            } else {
+                vec![]
+            }
+        }
+        "gradle" => {
+            let cache = home.join(".gradle").join("caches");
+            if cache.exists() {
+                vec![(cache, "gradle caches".into())]
+            } else {
+                vec![]
+            }
+        }
+        "pnpm" => {
+            let store = home.join(".local").join("share").join("pnpm").join("store");
+            if store.exists() {
+                vec![(store, "pnpm store".into())]
+            } else {
+                vec![]
+            }
+        }
+        "yarn" => {
+            let cache = home.join(".cache").join("yarn");
+            if cache.exists() {
+                vec![(cache, "yarn cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "bun" => {
+            let cache = home.join(".bun").join("install").join("cache");
+            if cache.exists() {
+                vec![(cache, "bun cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "deno" => {
+            let cache = home.join(".cache").join("deno");
+            if cache.exists() {
+                vec![(cache, "deno cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "composer" => {
+            let cache = home.join(".cache").join("composer");
+            if cache.exists() {
+                vec![(cache, "composer cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "docker" => {
+            let root = PathBuf::from("/var/lib/docker");
+            if root.exists() {
+                vec![(root, "docker data".into())]
+            } else {
+                vec![]
+            }
+        }
+        "hex" => {
+            let cache = home.join(".cache").join("hex");
+            if cache.exists() {
+                vec![(cache, "hex cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "pub" => {
+            let cache = home.join(".pub-cache");
+            if cache.exists() {
+                vec![(cache, "pub cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "nuget" => {
+            let cache = home.join(".nuget").join("packages");
+            if cache.exists() {
+                vec![(cache, "nuget packages".into())]
+            } else {
+                vec![]
+            }
+        }
+        "vcpkg" => {
+            let cache = PathBuf::from("/usr/local/share/vcpkg");
+            if cache.exists() {
+                vec![(cache, "vcpkg".into())]
+            } else {
+                vec![]
+            }
+        }
+        "zypper" => {
+            let cache = PathBuf::from("/var/cache/zypper");
+            if cache.exists() {
+                vec![(cache, "zypper cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "dnf" => {
+            let cache = PathBuf::from("/var/cache/dnf");
+            if cache.exists() {
+                vec![(cache, "dnf cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "pacman" => {
+            let cache = PathBuf::from("/var/cache/pacman/pkg");
+            if cache.exists() {
+                vec![(cache, "pacman cache".into())]
+            } else {
+                vec![]
+            }
+        }
+        "flatpak" => {
+            let cache = home.join(".cache").join("flatpak");
+            if cache.exists() {
+                vec![(cache, "flatpak cache".into())]
+            } else {
+                vec![]
+            }
+        }
         _ => vec![],
     }
 }
@@ -420,12 +603,35 @@ fn main() -> Result<()> {
                 None => vec![
                     "uv".into(),
                     "npm".into(),
+                    "pnpm".into(),
+                    "yarn".into(),
+                    "bun".into(),
+                    "deno".into(),
                     "cargo".into(),
+                    "go".into(),
+                    "pip".into(),
+                    "poetry".into(),
+                    "conda".into(),
+                    "pdm".into(),
+                    "gem".into(),
+                    "composer".into(),
+                    "maven".into(),
+                    "gradle".into(),
+                    "hex".into(),
+                    "pub".into(),
+                    "nuget".into(),
                     "journalctl".into(),
                     "apt".into(),
                     "snap".into(),
-                    "mise".into(),
                     "brew".into(),
+                    "mise".into(),
+                    "pacman".into(),
+                    "dnf".into(),
+                    "zypper".into(),
+                    "flatpak".into(),
+                    "docker".into(),
+                    "winget".into(),
+                    "vcpkg".into(),
                 ],
             };
 
