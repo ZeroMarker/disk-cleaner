@@ -54,6 +54,17 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 - **原生命令**：工具自行管理缓存清理，最安全
 - **目录删除**：直接删除缓存目录，下次使用时自动重建
 
+### 路径安全校验
+
+扫描和实际删除前都会校验路径。以下路径会被跳过：
+
+- 根目录、用户主目录以及 `/etc`、`/usr`、`/var` 等系统关键目录
+- 不存在、不是目录或最终解析位置发生变化的符号链接路径
+- 与工具预期目录形态不匹配的路径，例如把 WinGet `Packages` 当成缓存
+- 层级过浅、可能代表磁盘或应用数据根目录的路径
+
+实际删除前会再次校验，避免扫描后目录被替换。
+
 ---
 
 ## 安全等级说明
@@ -91,9 +102,9 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
-| cargo | `~/.cargo/registry`, `~/.cargo/git` | 目录删除 | Crate 注册表和 git 依赖缓存 |
-| go | `~/.cache/go-build`, `~/go/pkg/mod` | `go clean -cache -modcache` | 编译缓存和模块缓存 |
-| maven | `~/.m2/repository` | `mvn dependency:purge-local-repository` | Maven 依赖仓库 |
+| cargo | `$CARGO_HOME/{registry,git}` | 目录删除 | 未设置时回退到 `~/.cargo` |
+| go | `$GOCACHE`, `$GOMODCACHE` | `go clean -cache -modcache` | 优先读取环境变量和 `go env` |
+| maven | `$MAVEN_REPO_LOCAL` 或 `~/.m2/repository` | 目录删除 | Maven 本地依赖仓库 |
 | gradle | `~/.gradle/caches` | 目录删除 | Gradle 构建缓存 |
 | vcpkg | `/usr/local/share/vcpkg/{buildtrees,downloads,packages}` | 目录删除 | 仅清理缓存子目录，不删除安装本体 |
 
@@ -101,31 +112,31 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
-| gem | `~/.gem/cache` | `gem cleanup` | Ruby gem 缓存 |
+| gem | `$GEM_HOME/cache`（回退到 `gem env home`） | 目录删除 | Ruby 下载包缓存 |
 | composer | `~/.cache/composer` | `composer clear-cache` | PHP Composer 包缓存 |
-| hex | `~/.cache/hex` | 目录删除 | Elixir/Hex 包缓存 |
-| pub | `~/.pub-cache` | `dart pub cache clean` | Dart/Flutter 包缓存 |
-| nuget | `~/.nuget/packages` | `dotnet nuget locals all --clear` | .NET NuGet 包缓存 |
+| hex | `$HEX_HOME/packages` | 目录删除 | 未设置时回退到 `~/.hex/packages` |
+| pub | `$PUB_CACHE` | `dart pub cache clean` | 未设置时回退到 `~/.pub-cache` |
+| nuget | `$NUGET_PACKAGES` | `dotnet nuget locals all --clear` | 未设置时回退到 `~/.nuget/packages` |
 
 ### 系统包管理器
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
-| apt | `/var/cache/apt/archives` | `apt-get clean` | deb 包缓存 |
+| apt | `/var/cache/apt/archives` | `apt-get clean` | deb 包缓存；不把 apt lists 计入可回收空间 |
 | dnf | `/var/cache/dnf` | `dnf clean all` | RPM 包缓存 |
 | pacman | `/var/cache/pacman/pkg` | 目录删除 | Arch Linux 包缓存 |
-| zypper | `/var/cache/zypper` | `zypper clean` | openSUSE 包缓存 |
+| zypper | `/var/cache/zypp` | `zypper clean` | openSUSE 包缓存 |
 | snap | `/var/lib/snapd/cache` | 目录删除 | Snap 缓存 |
-| flatpak | `~/.cache/flatpak` | `flatpak uninstall --unused` | Flatpak 未使用运行时 |
-| brew | `~/.cache/Homebrew` 或 `/home/linuxbrew/.cache/Homebrew` | `brew cleanup --cache` | Homebrew 下载缓存 |
-| winget | `%LOCALAPPDATA%/Microsoft/WinGet/Packages` | 目录删除 | Windows 包缓存 |
+| flatpak | 不进行目录扫描 | 不自动清理 | 未使用运行时不是缓存目录，避免错误估算 |
+| brew | `brew --cache` 返回的目录 | `brew cleanup --cache` | Homebrew 下载缓存 |
+| winget | `%LOCALAPPDATA%/Temp/WinGet` | 目录删除 | WinGet 临时下载缓存；不删除便携包安装目录 |
 
 ### 运行时与容器
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
 | mise | `~/.cache/mise` | `mise cache clear` | 仅清理下载缓存，已安装工具不受影响 |
-| docker | `/var/lib/docker` | `docker system prune -f` | 清理悬空镜像、停止的容器、未使用的网络 |
+| docker | 不进行目录扫描 | 不自动清理 | 数据根目录含运行中数据，不能作为可回收空间估算 |
 
 ### 日志
 
@@ -180,10 +191,8 @@ disk-cleaner clean --path ~/projects
 ### Docker 清理
 
 ```bash
-# 使用 disk-cleaner 内置清理（等同 docker system prune -f）
-disk-cleaner cache --tool docker
-
-# 或手动使用更精细的命令
+# 先查看 Docker 自己计算的空间，再使用原生命令清理
+docker system df
 docker image prune          # 清理悬空镜像
 docker system prune         # 清理未使用的容器、网络、镜像
 docker system prune --volumes  # 包括卷（谨慎）
@@ -194,7 +203,7 @@ docker system prune --volumes  # 包括卷（谨慎）
 1. **首次运行建议使用 `--dry-run`**：确认清理范围后再执行
 2. **cargo/pip 等缓存删除后**：首次编译/安装会重新下载，耗时较长
 3. **mise 仅清理下载缓存**：已安装的工具版本不受影响
-4. **docker 使用 `system prune`**：安全清理悬空资源，不影响运行中的容器
+4. **Docker 不纳入自动目录清理**：使用 `docker system df/prune`，避免把数据根目录误算为可回收空间
 5. **系统包管理器缓存**（apt/dnf/pacman）：删除后不影响已安装的软件
 
 ---

@@ -10,7 +10,8 @@ use walkdir::WalkDir;
 #[derive(Parser)]
 #[command(
     name = "disk-cleaner",
-    about = "A fast disk cleanup tool written in Rust"
+    about = "A fast disk cleanup tool written in Rust",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -88,7 +89,7 @@ fn scan(dir: &str) -> Result<Vec<JunkFile>> {
             });
         }
     }
-    junk.sort_by(|a, b| b.size.cmp(&a.size));
+    junk.sort_by_key(|item| std::cmp::Reverse(item.size));
     Ok(junk)
 }
 
@@ -98,15 +99,133 @@ fn home_dir() -> PathBuf {
 
 fn dirs_or_home() -> PathBuf {
     std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root"))
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn xdg_cache_dir(home: &Path) -> PathBuf {
+    env_path("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache"))
+}
+
+fn command_path(cmd: &str, args: &[&str]) -> Option<PathBuf> {
+    let output = Command::new(cmd).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn is_protected_path(path: &Path) -> bool {
+    let protected = [
+        Path::new("/"),
+        Path::new("/bin"),
+        Path::new("/boot"),
+        Path::new("/dev"),
+        Path::new("/etc"),
+        Path::new("/home"),
+        Path::new("/lib"),
+        Path::new("/lib64"),
+        Path::new("/opt"),
+        Path::new("/proc"),
+        Path::new("/root"),
+        Path::new("/run"),
+        Path::new("/sbin"),
+        Path::new("/srv"),
+        Path::new("/sys"),
+        Path::new("/tmp"),
+        Path::new("/usr"),
+        Path::new("/var"),
+    ];
+    protected.contains(&path)
+}
+
+fn has_expected_cache_shape(tool: &str, path: &Path) -> bool {
+    let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    match tool {
+        "uv" => matches!(name, "uv" | "cache"),
+        "npm" => matches!(name, ".npm" | "npm" | "cache"),
+        "pnpm" => name == "store",
+        "yarn" => matches!(name, "yarn" | "cache"),
+        "bun" => name == "cache",
+        "deno" => matches!(name, "deno" | "cache"),
+        "cargo" => matches!(name, "registry" | "git"),
+        "go" => name == "go-build" || path.ends_with("pkg/mod"),
+        "pip" => matches!(name, "pip" | "cache"),
+        "poetry" => matches!(name, "pypoetry" | "cache"),
+        "conda" => name == "pkgs",
+        "pdm" => matches!(name, "pdm" | "cache"),
+        "composer" => matches!(name, "composer" | "cache"),
+        "maven" => name == "repository",
+        "gradle" => name == "caches",
+        "pub" => name == ".pub-cache",
+        "nuget" => name == "packages",
+        "mise" => matches!(name, "mise" | "cache"),
+        "brew" => name == "Homebrew",
+        "vcpkg" => matches!(name, "buildtrees" | "downloads" | "packages"),
+        "winget" => name.eq_ignore_ascii_case("WinGet"),
+        "gem" => name == "cache",
+        "hex" => name == "packages",
+        "apt" => path == Path::new("/var/cache/apt/archives"),
+        "snap" => path == Path::new("/var/lib/snapd/cache"),
+        "journalctl" => path == Path::new("/var/log/journal"),
+        "pacman" => path == Path::new("/var/cache/pacman/pkg"),
+        "dnf" => path == Path::new("/var/cache/dnf"),
+        "zypper" => path == Path::new("/var/cache/zypp"),
+        _ => true,
+    }
+}
+
+fn is_safe_cache_path(tool: &str, path: &Path) -> bool {
+    if !path.is_absolute() || is_protected_path(path) {
+        return false;
+    }
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    if canonical != path {
+        return false;
+    }
+    if is_protected_path(&canonical) || !has_expected_cache_shape(tool, &canonical) {
+        return false;
+    }
+
+    // A cache directory must be below the user profile or nested sufficiently
+    // deeply in the filesystem. The expected-shape check above still applies.
+    let home = home_dir().canonicalize().ok();
+    home.as_ref()
+        .is_some_and(|home| canonical.starts_with(home) && canonical != *home)
+        || canonical.components().count() >= 4
 }
 
 fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
     let home = home_dir();
+    let xdg_cache = xdg_cache_dir(&home);
     match tool {
         "uv" => {
-            let cache = home.join(".cache").join("uv");
+            let cache = env_path("UV_CACHE_DIR")
+                .or_else(|| command_path("uv", &["cache", "dir"]))
+                .unwrap_or_else(|| xdg_cache.join("uv"));
             if cache.exists() {
                 vec![(cache, "uv cache".into())]
             } else {
@@ -114,7 +233,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "npm" => {
-            let cache = home.join(".npm");
+            let cache = env_path("NPM_CONFIG_CACHE")
+                .or_else(|| command_path("npm", &["config", "get", "cache"]))
+                .unwrap_or_else(|| home.join(".npm"));
             if cache.exists() {
                 vec![(cache, "npm cache".into())]
             } else {
@@ -122,8 +243,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "cargo" => {
-            let registry = home.join(".cargo").join("registry");
-            let git = home.join(".cargo").join("git");
+            let cargo_home = env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+            let registry = cargo_home.join("registry");
+            let git = cargo_home.join("git");
             let mut dirs = Vec::new();
             if registry.exists() {
                 dirs.push((registry, "cargo crate source cache".into()));
@@ -143,13 +265,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
         }
         "apt" => {
             let archives = PathBuf::from("/var/cache/apt/archives");
-            let lists = PathBuf::from("/var/lib/apt/lists");
             let mut dirs = Vec::new();
             if archives.exists() {
                 dirs.push((archives, "apt archives".into()));
-            }
-            if lists.exists() {
-                dirs.push((lists, "apt lists".into()));
             }
             dirs
         }
@@ -162,10 +280,11 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             dirs
         }
         "winget" => {
-            let local = std::env::var("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/tmp"));
-            let cache = local.join("Microsoft/WinGet/Packages");
+            // Packages contains installed portable applications, not disposable cache.
+            let Some(local) = env_path("LOCALAPPDATA") else {
+                return vec![];
+            };
+            let cache = local.join("Temp").join("WinGet");
             if cache.exists() {
                 vec![(cache, "winget cache".into())]
             } else {
@@ -173,7 +292,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "mise" => {
-            let cache = home.join(".cache").join("mise");
+            let cache = env_path("MISE_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("mise"));
             if cache.exists() {
                 vec![(cache, "mise cache".into())]
             } else {
@@ -182,18 +301,22 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
         }
         "brew" => {
             let mut dirs = Vec::new();
-            let linux_cache = PathBuf::from("/home/linuxbrew/.cache/Homebrew");
-            let mac_cache = home.join("Library/Caches/Homebrew");
-            if linux_cache.exists() {
-                dirs.push((linux_cache, "brew cache".into()));
-            }
-            if mac_cache.exists() {
-                dirs.push((mac_cache, "brew cache".into()));
+            let cache = command_path("brew", &["--cache"]).unwrap_or_else(|| {
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Caches/Homebrew")
+                } else {
+                    xdg_cache.join("Homebrew")
+                }
+            });
+            if cache.exists() {
+                dirs.push((cache, "brew cache".into()));
             }
             dirs
         }
         "pip" => {
-            let cache = home.join(".cache").join("pip");
+            let cache = env_path("PIP_CACHE_DIR")
+                .or_else(|| command_path("pip", &["cache", "dir"]))
+                .unwrap_or_else(|| xdg_cache.join("pip"));
             if cache.exists() {
                 vec![(cache, "pip cache".into())]
             } else {
@@ -201,7 +324,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "poetry" => {
-            let cache = home.join(".cache").join("pypoetry");
+            let cache = env_path("POETRY_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pypoetry"));
             if cache.exists() {
                 vec![(cache, "poetry cache".into())]
             } else {
@@ -209,7 +332,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "conda" => {
-            let cache = home.join(".conda").join("pkgs");
+            let cache = env_path("CONDA_PKGS_DIRS")
+                .and_then(|p| std::env::split_paths(&p).next())
+                .unwrap_or_else(|| home.join(".conda").join("pkgs"));
             if cache.exists() {
                 vec![(cache, "conda pkgs".into())]
             } else {
@@ -217,7 +342,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "pdm" => {
-            let cache = home.join(".cache").join("pdm");
+            let cache = env_path("PDM_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pdm"));
             if cache.exists() {
                 vec![(cache, "pdm cache".into())]
             } else {
@@ -225,11 +350,15 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "go" => {
-            let gopath = std::env::var("GOPATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| home.join("go"));
-            let cache = home.join(".cache").join("go-build");
-            let mod_cache = gopath.join("pkg").join("mod");
+            let gopath = env_path("GOPATH")
+                .or_else(|| command_path("go", &["env", "GOPATH"]))
+                .unwrap_or_else(|| home.join("go"));
+            let cache = env_path("GOCACHE")
+                .or_else(|| command_path("go", &["env", "GOCACHE"]))
+                .unwrap_or_else(|| xdg_cache.join("go-build"));
+            let mod_cache = env_path("GOMODCACHE")
+                .or_else(|| command_path("go", &["env", "GOMODCACHE"]))
+                .unwrap_or_else(|| gopath.join("pkg").join("mod"));
             let mut dirs = Vec::new();
             if cache.exists() {
                 dirs.push((cache, "go build cache".into()));
@@ -240,7 +369,10 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             dirs
         }
         "gem" => {
-            let cache = home.join(".gem").join("cache");
+            let cache = env_path("GEM_HOME")
+                .or_else(|| command_path("gem", &["env", "home"]))
+                .unwrap_or_else(|| home.join(".gem"))
+                .join("cache");
             if cache.exists() {
                 vec![(cache, "gem cache".into())]
             } else {
@@ -248,7 +380,8 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "maven" => {
-            let cache = home.join(".m2").join("repository");
+            let cache =
+                env_path("MAVEN_REPO_LOCAL").unwrap_or_else(|| home.join(".m2").join("repository"));
             if cache.exists() {
                 vec![(cache, "maven dependency cache".into())]
             } else {
@@ -256,7 +389,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "gradle" => {
-            let cache = home.join(".gradle").join("caches");
+            let cache = env_path("GRADLE_USER_HOME")
+                .unwrap_or_else(|| home.join(".gradle"))
+                .join("caches");
             if cache.exists() {
                 vec![(cache, "gradle caches".into())]
             } else {
@@ -272,12 +407,12 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "yarn" => {
-            let cache = home.join(".cache").join("yarn");
-            if cache.exists() {
-                vec![(cache, "yarn cache".into())]
-            } else {
-                vec![]
-            }
+            let candidates = [xdg_cache.join("yarn"), home.join(".yarn/berry/cache")];
+            candidates
+                .into_iter()
+                .filter(|p| p.exists())
+                .map(|p| (p, "yarn cache".into()))
+                .collect()
         }
         "bun" => {
             let cache = home.join(".bun").join("install").join("cache");
@@ -288,7 +423,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "deno" => {
-            let cache = home.join(".cache").join("deno");
+            let cache = env_path("DENO_DIR").unwrap_or_else(|| xdg_cache.join("deno"));
             if cache.exists() {
                 vec![(cache, "deno cache".into())]
             } else {
@@ -296,7 +431,9 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "composer" => {
-            let cache = home.join(".cache").join("composer");
+            let cache = env_path("COMPOSER_CACHE_DIR")
+                .or_else(|| command_path("composer", &["config", "cache-dir", "--global"]))
+                .unwrap_or_else(|| xdg_cache.join("composer"));
             if cache.exists() {
                 vec![(cache, "composer cache".into())]
             } else {
@@ -304,21 +441,13 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "docker" => {
-            if Command::new("docker")
-                .args(["info"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                vec![(PathBuf::from("/var/lib/docker"), "docker".into())]
-            } else {
-                vec![]
-            }
+            // /var/lib/docker includes live data and cannot be used as a reclaimable-size estimate.
+            vec![]
         }
         "hex" => {
-            let cache = home.join(".cache").join("hex");
+            let cache = env_path("HEX_HOME")
+                .unwrap_or_else(|| home.join(".hex"))
+                .join("packages");
             if cache.exists() {
                 vec![(cache, "hex cache".into())]
             } else {
@@ -326,7 +455,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "pub" => {
-            let cache = home.join(".pub-cache");
+            let cache = env_path("PUB_CACHE").unwrap_or_else(|| home.join(".pub-cache"));
             if cache.exists() {
                 vec![(cache, "pub cache".into())]
             } else {
@@ -334,7 +463,8 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "nuget" => {
-            let cache = home.join(".nuget").join("packages");
+            let cache =
+                env_path("NUGET_PACKAGES").unwrap_or_else(|| home.join(".nuget").join("packages"));
             if cache.exists() {
                 vec![(cache, "nuget packages".into())]
             } else {
@@ -342,7 +472,8 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "vcpkg" => {
-            let root = PathBuf::from("/usr/local/share/vcpkg");
+            let root =
+                env_path("VCPKG_ROOT").unwrap_or_else(|| PathBuf::from("/usr/local/share/vcpkg"));
             let mut dirs = Vec::new();
             for subdir in &["buildtrees", "downloads", "packages"] {
                 let cache = root.join(subdir);
@@ -353,7 +484,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             dirs
         }
         "zypper" => {
-            let cache = PathBuf::from("/var/cache/zypper");
+            let cache = PathBuf::from("/var/cache/zypp");
             if cache.exists() {
                 vec![(cache, "zypper cache".into())]
             } else {
@@ -377,12 +508,8 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             }
         }
         "flatpak" => {
-            let cache = home.join(".cache").join("flatpak");
-            if cache.exists() {
-                vec![(cache, "flatpak cache".into())]
-            } else {
-                vec![]
-            }
+            // `flatpak uninstall --unused` manages installations, not a cache directory.
+            vec![]
         }
         _ => vec![],
     }
@@ -392,7 +519,7 @@ fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
     let mut junk = Vec::new();
     for tool in tools {
         for (dir, category) in get_cache_dirs(tool) {
-            if dir.exists() {
+            if is_safe_cache_path(tool, &dir) {
                 let size = dir_size(&dir);
                 if size > 0 {
                     junk.push(JunkFile {
@@ -401,10 +528,17 @@ fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
                         category,
                     });
                 }
+            } else if dir.exists() {
+                eprintln!(
+                    "  {} unsafe or unexpected {} path: {}",
+                    "skipped".yellow(),
+                    tool,
+                    dir.display()
+                );
             }
         }
     }
-    junk.sort_by(|a, b| b.size.cmp(&a.size));
+    junk.sort_by_key(|item| std::cmp::Reverse(item.size));
     Ok(junk)
 }
 
@@ -420,9 +554,7 @@ fn get_clean_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "poetry" => Some(("poetry", vec!["cache", "clear", "--all", "."])),
         "conda" => Some(("conda", vec!["clean", "--all", "-y"])),
         "pdm" => Some(("pdm", vec!["cache", "clear"])),
-        "gem" => Some(("gem", vec!["cleanup"])),
         "composer" => Some(("composer", vec!["clear-cache"])),
-        "maven" => Some(("mvn", vec!["dependency:purge-local-repository"])),
         "pub" => Some(("dart", vec!["pub", "cache", "clean"])),
         "nuget" => Some(("dotnet", vec!["nuget", "locals", "all", "--clear"])),
         "apt" => Some(("apt-get", vec!["clean"])),
@@ -430,23 +562,28 @@ fn get_clean_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "mise" => Some(("mise", vec!["cache", "clear"])),
         "dnf" => Some(("dnf", vec!["clean", "all"])),
         "zypper" => Some(("zypper", vec!["clean"])),
-        "flatpak" => Some(("flatpak", vec!["uninstall", "--unused"])),
         "journalctl" => Some(("journalctl", vec!["--vacuum-time=3d"])),
-        "docker" => Some(("docker", vec!["system", "prune", "-f"])),
         "uv" => Some(("uv", vec!["cache", "clean"])),
         _ => None,
     }
 }
 
-fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<()> {
+fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<bool> {
     let Some((cmd, args)) = get_clean_cmd(tool) else {
-        return Ok(());
+        return Ok(false);
     };
     if dry_run {
         println!("  {} {} {}", "[dry-run]".yellow(), cmd, args.join(" "));
-        return Ok(());
+        return Ok(true);
     }
-    let output = Command::new(cmd).args(&args).output()?;
+    let output = match Command::new(cmd).args(&args).output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("  {} command not found: {cmd}", "fallback".yellow());
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if output.status.success() {
         let out = String::from_utf8_lossy(&output.stderr);
         if out.is_empty() {
@@ -459,6 +596,7 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<()> {
                 println!("  {}", line.dimmed());
             }
         }
+        Ok(true)
     } else {
         let err = String::from_utf8_lossy(&output.stderr);
         println!(
@@ -468,8 +606,8 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<()> {
             args.join(" "),
             err.trim()
         );
+        Ok(false)
     }
-    Ok(())
 }
 
 fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
@@ -479,13 +617,25 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
         let tool = item.category.split_whitespace().next().unwrap_or("");
         if get_clean_cmd(tool).is_some() {
             if cmd_cleaned.insert(tool.to_string()) {
-                run_clean_cmd(tool, dry_run)?;
+                if run_clean_cmd(tool, dry_run)? {
+                    continue;
+                }
+                cmd_cleaned.remove(tool);
+            } else {
+                continue;
             }
-            continue;
         }
         if dry_run {
             println!("  {} {}", "[dry-run]".yellow(), item.path.display());
         } else {
+            if !is_safe_cache_path(tool, &item.path) {
+                println!(
+                    "  {} unsafe or changed path: {}",
+                    "skipped".yellow(),
+                    item.path.display()
+                );
+                continue;
+            }
             let res = fs::remove_dir_all(&item.path);
             match res {
                 Ok(_) => {
@@ -719,4 +869,54 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_cache_resources_are_not_cleaned_by_commands() {
+        for tool in ["docker", "flatpak", "winget", "gem", "maven"] {
+            assert!(
+                get_clean_cmd(tool).is_none(),
+                "unexpected command for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn apt_uses_the_matching_archive_cleanup_command() {
+        assert_eq!(get_clean_cmd("apt"), Some(("apt-get", vec!["clean"])));
+    }
+
+    #[test]
+    fn formats_binary_sizes() {
+        assert_eq!(format_size(1024), "1.00 KB");
+        assert_eq!(format_size(1_048_576), "1.00 MB");
+    }
+
+    #[test]
+    fn cli_exposes_package_version() {
+        use clap::CommandFactory;
+
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn rejects_protected_and_mismatched_cache_paths() {
+        assert!(!is_safe_cache_path("npm", Path::new("/")));
+        assert!(!is_safe_cache_path("npm", &home_dir()));
+        assert!(!has_expected_cache_shape(
+            "winget",
+            Path::new("/Users/test/AppData/Local/Microsoft/WinGet/Packages")
+        ));
+        assert!(has_expected_cache_shape(
+            "winget",
+            Path::new("/Users/test/AppData/Local/Temp/WinGet")
+        ));
+    }
 }
