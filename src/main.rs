@@ -666,7 +666,11 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
             }
         }
         if dry_run {
-            println!("  {} {}", "[dry-run]".yellow(), item.path.display());
+            println!(
+                "  {} remove directory recursively: {}",
+                "[dry-run]".yellow(),
+                item.path.display()
+            );
         } else {
             if !is_safe_cache_path(tool, &item.path) {
                 println!(
@@ -1004,5 +1008,18 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_uses_directory_cleanup_fallback() {
+        assert!(get_clean_cmd("cargo").is_none());
+        assert!(has_expected_cache_shape(
+            "cargo",
+            Path::new("/home/user/.cargo/registry")
+        ));
+        assert!(has_expected_cache_shape(
+            "cargo",
+            Path::new("/home/user/.cargo/git")
+        ));
     }
 }
