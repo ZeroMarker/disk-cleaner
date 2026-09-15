@@ -48,7 +48,12 @@ fn is_junk(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    if path.is_dir() {
+    // Never classify symlinked directories as cleanup targets. A symlink can
+    // point outside the scanned tree and must not become a recursive delete.
+    let is_real_dir = fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_real_dir {
         match name {
             "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | "target"
             | ".gradle" | ".cache" | ".npm" | ".yarn" | "dist" | "build" => {
@@ -72,21 +77,34 @@ fn dir_size(path: &Path) -> u64 {
     WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false))
+        .filter(|e| e.file_type().is_file())
         .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
         .sum()
 }
 
 fn scan(dir: &str) -> Result<Vec<JunkFile>> {
     let mut junk = Vec::new();
-    for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    let mut entries = WalkDir::new(dir).into_iter();
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
         if let Some(category) = is_junk(entry.path()) {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = if entry.file_type().is_dir() {
+                dir_size(entry.path())
+            } else {
+                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            };
             junk.push(JunkFile {
                 path: entry.path().to_path_buf(),
                 size,
                 category,
             });
+
+            // A matched directory is one cleanup item. Do not traverse its
+            // contents, otherwise every nested file is reported as a second
+            // item and later deletion attempts fail after the parent is gone.
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
         }
     }
     junk.sort_by_key(|item| std::cmp::Reverse(item.size));
@@ -735,7 +753,23 @@ fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
         if dry_run {
             println!("  {} {}", "[dry-run]".yellow(), item.path.display());
         } else {
-            let res = if item.path.is_dir() {
+            let metadata = match fs::symlink_metadata(&item.path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    println!(
+                        "  {} {} ({})",
+                        "skipped".yellow(),
+                        item.path.display(),
+                        error
+                    );
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() {
+                println!("  {} symlink: {}", "skipped".yellow(), item.path.display());
+                continue;
+            }
+            let res = if metadata.is_dir() {
                 fs::remove_dir_all(&item.path)
             } else {
                 fs::remove_file(&item.path)
@@ -918,5 +952,35 @@ mod tests {
             "winget",
             Path::new("/Users/test/AppData/Local/Temp/WinGet")
         ));
+    }
+
+    #[test]
+    fn scan_aggregates_and_skips_contents_of_junk_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "disk-cleaner-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("scan")
+        ));
+        let target = root.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join("debug/artifact.bin"), vec![0u8; 128]).unwrap();
+        fs::write(root.join("notes.log"), vec![0u8; 7]).unwrap();
+
+        let results = scan(root.to_str().unwrap()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .find(|item| item.path == target)
+                .map(|item| item.size),
+            Some(128)
+        );
+        assert!(
+            !results
+                .iter()
+                .any(|item| item.path.ends_with("artifact.bin"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
