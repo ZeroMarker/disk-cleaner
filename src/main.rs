@@ -10,8 +10,10 @@ use walkdir::WalkDir;
 #[derive(Parser)]
 #[command(
     name = "disk-cleaner",
-    about = "A fast disk cleanup tool written in Rust",
-    version
+    about = "Scan and safely remove disposable files, build artifacts, and tool caches",
+    long_about = "A fast disk cleanup tool for finding and removing disposable files, build artifacts, temporary files, and package-manager caches.\n\nStart with a dry run to review what would be removed.",
+    version,
+    after_help = "Examples:\n  disk-cleaner scan --path ~/projects\n  disk-cleaner clean --path . --dry-run\n  disk-cleaner cache --dry-run\n  disk-cleaner cache --tool npm\n\nRun 'disk-cleaner <COMMAND> --help' for command-specific options."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -20,19 +22,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Recursively find junk files and directories without deleting anything.
+    #[command(
+        long_about = "Recursively scan a directory for known junk files and directories. Results are sorted by reclaimable size.\n\nThis command is read-only.",
+        after_help = "Examples:\n  disk-cleaner scan\n  disk-cleaner scan --path ~/projects"
+    )]
     Scan {
-        #[arg(short, long, default_value = ".")]
+        /// Directory to scan (defaults to the current directory).
+        #[arg(short, long, default_value = ".", value_name = "DIR")]
         path: String,
     },
+    /// Scan for junk, then optionally delete the listed items.
+    #[command(
+        long_about = "Scan a directory and ask for confirmation before deleting detected junk. Use --dry-run to preview the cleanup without changing files.\n\nMatched cache/build directories are treated as a single item and their contents are not listed separately.",
+        after_help = "Examples:\n  disk-cleaner clean --path . --dry-run\n  disk-cleaner clean --path ~/projects"
+    )]
     Clean {
-        #[arg(short, long, default_value = ".")]
+        /// Directory to clean (defaults to the current directory).
+        #[arg(short, long, default_value = ".", value_name = "DIR")]
         path: String,
+        /// Show what would be deleted without changing anything.
         #[arg(short, long)]
         dry_run: bool,
     },
+    /// Find and clean package-manager and system-tool caches.
+    #[command(
+        long_about = "Find caches for supported package managers and development tools. Native cleanup commands are preferred when available; otherwise, validated cache directories are removed.\n\nUse --dry-run first. Some system caches may require elevated permissions.",
+        after_help = "Examples:\n  disk-cleaner cache --dry-run\n  disk-cleaner cache --tool npm --dry-run\n  disk-cleaner cache --tool cargo\n\nSupported tools include: uv, npm, pnpm, yarn, bun, deno, cargo, go, pip, poetry, conda, pdm, gem, composer, maven, gradle, hex, pub, nuget, apt, snap, brew, mise, pacman, dnf, zypper, winget, and vcpkg."
+    )]
     Cache {
-        #[arg(short, long)]
+        /// Only clean this tool's cache; omit to scan all supported tools.
+        #[arg(short, long, value_name = "TOOL")]
         tool: Option<String>,
+        /// Show what would be cleaned without changing anything.
         #[arg(short, long)]
         dry_run: bool,
     },
