@@ -7,6 +7,40 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use walkdir::WalkDir;
 
+const SUPPORTED_TOOLS: &[&str] = &[
+    "uv",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "cargo",
+    "go",
+    "pip",
+    "poetry",
+    "conda",
+    "pdm",
+    "gem",
+    "composer",
+    "maven",
+    "gradle",
+    "hex",
+    "pub",
+    "nuget",
+    "journalctl",
+    "apt",
+    "snap",
+    "brew",
+    "mise",
+    "pacman",
+    "dnf",
+    "zypper",
+    "flatpak",
+    "docker",
+    "winget",
+    "vcpkg",
+];
+
 #[derive(Parser)]
 #[command(
     name = "disk-cleaner",
@@ -108,7 +142,14 @@ fn scan(dir: &str) -> Result<Vec<JunkFile>> {
     let mut junk = Vec::new();
     let mut entries = WalkDir::new(dir).into_iter();
     while let Some(entry) = entries.next() {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.depth() == 0 => return Err(error.into()),
+            Err(error) => {
+                eprintln!("  {} inaccessible path: {}", "skipped".yellow(), error);
+                continue;
+            }
+        };
         if let Some(category) = is_junk(entry.path()) {
             let size = if entry.file_type().is_dir() {
                 dir_size(entry.path())
@@ -658,6 +699,9 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
         if get_clean_cmd(tool).is_some() {
             if cmd_cleaned.insert(tool.to_string()) {
                 if run_clean_cmd(tool, dry_run)? {
+                    if !dry_run {
+                        cleaned += reclaimed_by_command(junk, tool);
+                    }
                     continue;
                 }
                 cmd_cleaned.remove(tool);
@@ -709,6 +753,20 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn reclaimed_by_command(junk: &[JunkFile], tool: &str) -> u64 {
+    junk.iter()
+        .filter(|item| item.category.split_whitespace().next() == Some(tool))
+        .map(|item| {
+            let remaining = if item.path.is_dir() {
+                dir_size(&item.path)
+            } else {
+                0
+            };
+            item.size.saturating_sub(remaining)
+        })
+        .sum()
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
         format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
@@ -745,11 +803,7 @@ fn display_results(junk: &[JunkFile]) {
 
     for item in junk.iter().take(50) {
         let path_str = item.path.display().to_string();
-        let display = if path_str.len() > 58 {
-            format!("...{}", &path_str[path_str.len() - 55..])
-        } else {
-            path_str
-        };
+        let display = truncate_path(&path_str, 58);
         println!(
             "  {:<60} {:>10}  {}",
             display,
@@ -771,6 +825,17 @@ fn display_results(junk: &[JunkFile]) {
         "Total reclaimable:".bold(),
         format_size(total).red().bold()
     );
+}
+
+fn truncate_path(path: &str, max_chars: usize) -> String {
+    let char_count = path.chars().count();
+    if char_count <= max_chars {
+        return path.to_owned();
+    }
+
+    let suffix_len = max_chars.saturating_sub(3);
+    let suffix: String = path.chars().skip(char_count - suffix_len).collect();
+    format!("...{suffix}")
 }
 
 fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
@@ -863,40 +928,12 @@ fn main() -> Result<()> {
         }
         Commands::Cache { tool, dry_run } => {
             let tools = match tool {
-                Some(t) => vec![t],
-                None => vec![
-                    "uv".into(),
-                    "npm".into(),
-                    "pnpm".into(),
-                    "yarn".into(),
-                    "bun".into(),
-                    "deno".into(),
-                    "cargo".into(),
-                    "go".into(),
-                    "pip".into(),
-                    "poetry".into(),
-                    "conda".into(),
-                    "pdm".into(),
-                    "gem".into(),
-                    "composer".into(),
-                    "maven".into(),
-                    "gradle".into(),
-                    "hex".into(),
-                    "pub".into(),
-                    "nuget".into(),
-                    "journalctl".into(),
-                    "apt".into(),
-                    "snap".into(),
-                    "brew".into(),
-                    "mise".into(),
-                    "pacman".into(),
-                    "dnf".into(),
-                    "zypper".into(),
-                    "flatpak".into(),
-                    "docker".into(),
-                    "winget".into(),
-                    "vcpkg".into(),
-                ],
+                Some(t) if SUPPORTED_TOOLS.contains(&t.as_str()) => vec![t],
+                Some(t) => anyhow::bail!(
+                    "unsupported tool '{t}'; supported tools: {}",
+                    SUPPORTED_TOOLS.join(", ")
+                ),
+                None => SUPPORTED_TOOLS.iter().map(|tool| (*tool).into()).collect(),
             };
 
             println!(
@@ -954,6 +991,34 @@ mod tests {
     fn formats_binary_sizes() {
         assert_eq!(format_size(1024), "1.00 KB");
         assert_eq!(format_size(1_048_576), "1.00 MB");
+    }
+
+    #[test]
+    fn truncates_utf8_paths_at_character_boundaries() {
+        let path = format!("/tmp/{}/artifact.log", "项目".repeat(40));
+        let display = truncate_path(&path, 58);
+
+        assert_eq!(display.chars().count(), 58);
+        assert!(display.starts_with("..."));
+        assert!(display.ends_with("artifact.log"));
+    }
+
+    #[test]
+    fn command_reclaim_uses_post_cleanup_size() {
+        let root =
+            std::env::temp_dir().join(format!("disk-cleaner-reclaim-test-{}", std::process::id()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("remaining.bin"), vec![0u8; 25]).unwrap();
+        let junk = vec![JunkFile {
+            path: cache,
+            size: 100,
+            category: "npm cache".into(),
+        }];
+
+        assert_eq!(reclaimed_by_command(&junk, "npm"), 75);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
