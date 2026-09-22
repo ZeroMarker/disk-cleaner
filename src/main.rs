@@ -1284,11 +1284,8 @@ mod tests {
 
     #[test]
     fn scan_aggregates_and_skips_contents_of_junk_directories() {
-        let root = std::env::temp_dir().join(format!(
-            "disk-cleaner-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("scan")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("disk-cleaner-scan-test-{}", std::process::id()));
         let target = root.join("target");
         fs::create_dir_all(target.join("debug")).unwrap();
         fs::write(root.join("Cargo.toml"), b"[package]\nname = \"fixture\"\n").unwrap();
