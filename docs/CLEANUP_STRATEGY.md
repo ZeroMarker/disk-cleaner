@@ -18,7 +18,7 @@
 
 | 类别 | 匹配方式 | 目标 |
 |------|----------|------|
-| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `target`, `.gradle`, `.cache`, `.npm`, `.yarn` |
+| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`, `.cache`, `.npm`, `.yarn`；`target` 仅在父目录有 `Cargo.toml` 时匹配 |
 | system | 文件名精确匹配 | `.DS_Store`, `Thumbs.db`, `desktop.ini` |
 | temp/log | 扩展名匹配 | `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*.bak`, `*.log` |
 
@@ -39,7 +39,7 @@
 
 ### 默认扫描范围
 
-不指定 `--tool` 时，扫描全部 31 个工具：
+不指定 `--tool` 时，检查以下 31 个工具；Docker 和 Flatpak 不进行自动扫描或清理：
 
 ```
 uv, npm, pnpm, yarn, bun, deno, cargo, go, pip, poetry, conda, pdm,
@@ -49,7 +49,7 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 
 ### 清理方式
 
-优先使用各工具的原生清理命令，无原生命令时回退到目录删除：
+优先使用各工具的原生清理命令，无原生命令或命令不可用时使用目录删除。命令运行失败后跳过该工具的目录，不自动删除：
 
 - **原生命令**：工具自行管理缓存清理，最安全
 - **目录删除**：直接删除缓存目录，下次使用时自动重建
@@ -71,8 +71,10 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 
 | 等级 | 说明 | 工具 |
 |------|------|------|
-| **安全** | 缓存可随时重建，删除后下次使用自动下载 | npm, pnpm, yarn, bun, cargo, go, pip, poetry, conda, pdm, gem, composer, maven, gradle, hex, pub, nuget, uv, brew, apt, dnf, zypper, pacman, flatpak, snap, winget, vcpkg |
-| **谨慎** | 删除后需重新下载工具或耗时较长 | mise, docker, journalctl, deno |
+| **安全** | 缓存可随时重建，删除后下次使用自动下载 | npm, pnpm, yarn, bun, cargo, go, pip, poetry, conda, pdm, gem, composer, maven, gradle, hex, pub, nuget, uv, brew, apt, dnf, zypper, pacman, snap, winget, vcpkg |
+| **谨慎** | 删除后需重新下载工具或耗时较长 | mise, journalctl, deno |
+
+Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 
 ---
 
@@ -86,7 +88,7 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 | pnpm | `~/.local/share/pnpm/store` | `pnpm store prune` | 内容寻址存储，清理未引用包 |
 | yarn | `~/.cache/yarn` | `yarn cache clean` | Yarn 1.x 缓存目录 |
 | bun | `~/.bun/install/cache` | `bun pm cache rm` | Bun 包缓存 |
-| deno | `~/.cache/deno` | 目录删除 | TypeScript/JS 编译缓存和远程模块缓存 |
+| deno | `~/.cache/deno` | `deno clean` | TypeScript/JS 编译缓存和远程模块缓存 |
 
 ### Python 生态
 
