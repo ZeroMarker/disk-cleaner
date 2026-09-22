@@ -102,6 +102,7 @@ struct JunkFile {
     path: PathBuf,
     size: u64,
     category: String,
+    tool: Option<String>,
 }
 
 struct ScanResult {
@@ -212,6 +213,7 @@ fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
                 path: entry.path().to_path_buf(),
                 size,
                 category,
+                tool: None,
             });
 
             // A matched directory is one cleanup item. Do not traverse its
@@ -320,12 +322,12 @@ fn has_expected_cache_shape(tool: &str, path: &Path) -> bool {
         "pacman" => path == Path::new("/var/cache/pacman/pkg"),
         "dnf" => path == Path::new("/var/cache/dnf"),
         "zypper" => path == Path::new("/var/cache/zypp"),
-        _ => true,
+        _ => false,
     }
 }
 
 fn is_safe_cache_path(tool: &str, path: &Path) -> bool {
-    if !path.is_absolute() || is_protected_path(path) {
+    if !SUPPORTED_TOOLS.contains(&tool) || !path.is_absolute() || is_protected_path(path) {
         return false;
     }
 
@@ -674,6 +676,7 @@ fn scan_cache(tools: &[String]) -> Result<ScanResult> {
                         path: dir,
                         size,
                         category,
+                        tool: Some(tool.clone()),
                     });
                 }
             } else if dir.exists() {
@@ -797,12 +800,24 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
 }
 
 fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
+    for item in junk {
+        let Some(tool) = item.tool.as_deref() else {
+            anyhow::bail!("cache item has no tool identity: {}", item.path.display());
+        };
+        if !is_safe_cache_path(tool, &item.path) {
+            anyhow::bail!(
+                "unsafe or changed {tool} cache path: {}",
+                item.path.display()
+            );
+        }
+    }
+
     let mut cleaned = 0u64;
     let mut planned = 0u64;
     let mut had_failure = false;
     let mut cmd_cleaned = std::collections::HashSet::new();
     for item in junk {
-        let tool = item.category.split_whitespace().next().unwrap_or("");
+        let tool = item.tool.as_deref().expect("cache items were validated");
         if get_clean_cmd(tool).is_some() {
             if cmd_cleaned.insert(tool.to_string()) {
                 match run_clean_cmd(tool, dry_run)? {
@@ -810,9 +825,7 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                         if dry_run {
                             planned += junk
                                 .iter()
-                                .filter(|entry| {
-                                    entry.category.split_whitespace().next() == Some(tool)
-                                })
+                                .filter(|entry| entry.tool.as_deref() == Some(tool))
                                 .map(|entry| entry.size)
                                 .sum::<u64>();
                         } else {
@@ -900,7 +913,7 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
 
 fn reclaimed_by_command(junk: &[JunkFile], tool: &str) -> Result<u64> {
     junk.iter()
-        .filter(|item| item.category.split_whitespace().next() == Some(tool))
+        .filter(|item| item.tool.as_deref() == Some(tool))
         .map(|item| {
             let remaining = if item.path.is_dir() {
                 dir_size(&item.path)?
@@ -1208,7 +1221,8 @@ mod tests {
         let junk = vec![JunkFile {
             path: cache,
             size: 100,
-            category: "npm cache".into(),
+            category: "renamed cache label".into(),
+            tool: Some("npm".into()),
         }];
 
         assert_eq!(reclaimed_by_command(&junk, "npm").unwrap(), 75);
@@ -1235,6 +1249,7 @@ mod tests {
             path: missing,
             size: 1,
             category: "system".into(),
+            tool: None,
         }];
         assert!(clean(&junk, false, false).is_err());
     }
@@ -1273,6 +1288,10 @@ mod tests {
         assert!(!is_safe_cache_path("npm", Path::new("/")));
         assert!(!is_safe_cache_path("npm", &home_dir()));
         assert!(!has_expected_cache_shape(
+            "unknown",
+            Path::new("/tmp/cache")
+        ));
+        assert!(!has_expected_cache_shape(
             "winget",
             Path::new("/Users/test/AppData/Local/Microsoft/WinGet/Packages")
         ));
@@ -1280,6 +1299,44 @@ mod tests {
             "winget",
             Path::new("/Users/test/AppData/Local/Temp/WinGet")
         ));
+    }
+
+    #[test]
+    fn cache_item_without_tool_identity_is_rejected_before_deletion() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "disk-cleaner-cache-identity-test-{}",
+            std::process::id()
+        ));
+        let cache = root.join("cache");
+        let registry = root.join("registry");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&registry).unwrap();
+        let marker = cache.join("keep.bin");
+        let registry_marker = registry.join("keep.bin");
+        fs::write(&marker, b"keep").unwrap();
+        fs::write(&registry_marker, b"keep").unwrap();
+        assert!(is_safe_cache_path("npm", &cache));
+        assert!(!is_safe_cache_path("unknown", &cache));
+
+        let junk = vec![
+            JunkFile {
+                path: registry,
+                size: 4,
+                category: "cargo cache".into(),
+                tool: Some("cargo".into()),
+            },
+            JunkFile {
+                path: cache,
+                size: 4,
+                category: "npm cache".into(),
+                tool: None,
+            },
+        ];
+        assert!(clean_cache(&junk, false).is_err());
+        assert!(marker.exists());
+        assert!(registry_marker.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
