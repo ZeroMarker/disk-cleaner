@@ -18,13 +18,15 @@
 
 | 类别 | 匹配方式 | 目标 |
 |------|----------|------|
-| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`, `.cache`, `.npm`, `.yarn`；`target` 仅在父目录有 `Cargo.toml` 时匹配 |
+| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`；`target` 仅在父目录有 `Cargo.toml` 时匹配 |
 | system | 文件名精确匹配 | `.DS_Store`, `Thumbs.db`, `desktop.ini` |
-| temp/log | 扩展名匹配 | `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*.bak`, `*.log` |
+| temp/log | 使用 `--include-files` 时按扩展名匹配 | `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*.bak`, `*.log` |
+
+默认不匹配通用 `.cache`、`.npm`、`.yarn`、`build` 或 `dist` 目录。扫描遇到无法完整读取的路径时会报告错误，`clean` 不会继续执行。
 
 ### 排序规则
 
-结果按文件大小降序排列，优先展示占用空间最大的文件。
+结果按文件逻辑大小降序排列。该数字是内容大小估计值，不等于实际释放的磁盘空间。
 
 ---
 
@@ -39,17 +41,17 @@
 
 ### 默认扫描范围
 
-不指定 `--tool` 时，检查以下 31 个工具；Docker 和 Flatpak 不进行自动扫描或清理：
+不指定 `--tool` 时，检查以下 29 个工具：
 
 ```
 uv, npm, pnpm, yarn, bun, deno, cargo, go, pip, poetry, conda, pdm,
 gem, composer, maven, gradle, hex, pub, nuget, journalctl, apt, snap,
-brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
+brew, mise, pacman, dnf, zypper, winget, vcpkg
 ```
 
 ### 清理方式
 
-优先使用各工具的原生清理命令，无原生命令或命令不可用时使用目录删除。命令运行失败后跳过该工具的目录，不自动删除：
+有原生清理命令的工具只使用该命令；命令不可用或执行失败时跳过该工具，并返回错误。仅无原生命令的工具使用目录删除：
 
 - **原生命令**：工具自行管理缓存清理，最安全
 - **目录删除**：直接删除缓存目录，下次使用时自动重建
@@ -59,7 +61,7 @@ brew, mise, pacman, dnf, zypper, flatpak, docker, winget, vcpkg
 扫描和实际删除前都会校验路径。以下路径会被跳过：
 
 - 根目录、用户主目录以及 `/etc`、`/usr`、`/var` 等系统关键目录
-- 不存在、不是目录或最终解析位置发生变化的符号链接路径
+- 不存在、不是目录或任一路径组件为符号链接的路径
 - 与工具预期目录形态不匹配的路径，例如把 WinGet `Packages` 当成缓存
 - 层级过浅、可能代表磁盘或应用数据根目录的路径
 

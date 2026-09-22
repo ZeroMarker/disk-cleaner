@@ -35,8 +35,6 @@ const SUPPORTED_TOOLS: &[&str] = &[
     "pacman",
     "dnf",
     "zypper",
-    "flatpak",
-    "docker",
     "winget",
     "vcpkg",
 ];
@@ -45,7 +43,7 @@ const SUPPORTED_TOOLS: &[&str] = &[
 #[command(
     name = "disk-cleaner",
     about = "Scan and safely remove disposable files, build artifacts, and tool caches",
-    long_about = "A fast disk cleanup tool for finding and removing disposable files, build artifacts, temporary files, and package-manager caches.\n\nStart with a dry run to review what would be removed.",
+    long_about = "A fast disk cleanup tool for finding and removing disposable files, build artifacts, and package-manager caches. Temporary, swap, backup, and log files require --include-files when scanning a directory.\n\nStart with a dry run to review what would be removed.",
     version,
     after_help = "Examples:\n  disk-cleaner scan --path ~/projects\n  disk-cleaner clean --path . --dry-run\n  disk-cleaner cache --dry-run\n  disk-cleaner cache --tool npm\n\nRun 'disk-cleaner <COMMAND> --help' for command-specific options."
 )]
@@ -58,13 +56,16 @@ struct Cli {
 enum Commands {
     /// Recursively find junk files and directories without deleting anything.
     #[command(
-        long_about = "Recursively scan a directory for known junk files and directories. Results are sorted by reclaimable size.\n\nThis command is read-only.",
+        long_about = "Recursively scan a directory for known disposable files and directories. Results are sorted by matched size. Use --include-files to include temporary, swap, backup, and log files.\n\nThis command is read-only.",
         after_help = "Examples:\n  disk-cleaner scan\n  disk-cleaner scan --path ~/projects"
     )]
     Scan {
         /// Directory to scan (defaults to the current directory).
         #[arg(short, long, default_value = ".", value_name = "DIR")]
         path: String,
+        /// Also include temporary, swap, backup, and log files.
+        #[arg(long)]
+        include_files: bool,
     },
     /// Scan for junk, then optionally delete the listed items.
     #[command(
@@ -75,13 +76,16 @@ enum Commands {
         /// Directory to clean (defaults to the current directory).
         #[arg(short, long, default_value = ".", value_name = "DIR")]
         path: String,
+        /// Also include temporary, swap, backup, and log files.
+        #[arg(long)]
+        include_files: bool,
         /// Show what would be deleted without changing anything.
         #[arg(short, long)]
         dry_run: bool,
     },
     /// Find and clean package-manager and system-tool caches.
     #[command(
-        long_about = "Find caches for supported package managers and development tools. Native cleanup commands are preferred when available; otherwise, validated cache directories are removed.\n\nUse --dry-run first. Some system caches may require elevated permissions.",
+        long_about = "Find caches for supported package managers and development tools. A native cleanup command must be available to clean its tool's cache. Tools without native commands use validated directory deletion.\n\nUse --dry-run first. Some system caches may require elevated permissions.",
         after_help = "Examples:\n  disk-cleaner cache --dry-run\n  disk-cleaner cache --tool npm --dry-run\n  disk-cleaner cache --tool cargo\n\nSupported tools include: uv, npm, pnpm, yarn, bun, deno, cargo, go, pip, poetry, conda, pdm, gem, composer, maven, gradle, hex, pub, nuget, apt, snap, brew, mise, pacman, dnf, zypper, winget, and vcpkg."
     )]
     Cache {
@@ -100,70 +104,109 @@ struct JunkFile {
     category: String,
 }
 
-fn is_junk(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
+struct ScanResult {
+    items: Vec<JunkFile>,
+    skipped: usize,
+}
+
+fn is_junk(path: &Path, include_files: bool) -> Result<Option<String>> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     // Never classify symlinked directories as cleanup targets. A symlink can
     // point outside the scanned tree and must not become a recursive delete.
-    let metadata = fs::symlink_metadata(path).ok()?;
+    let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
         match name {
-            "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".gradle"
-            | ".cache" | ".npm" | ".yarn" => {
-                return Some("cache/build".into());
+            "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".gradle" => {
+                return Ok(Some("cache/build".into()));
             }
             "target"
                 if path
                     .parent()
                     .is_some_and(|parent| parent.join("Cargo.toml").is_file()) =>
             {
-                return Some("cache/build".into());
+                return Ok(Some("cache/build".into()));
             }
             _ => {}
         }
     }
 
     if !metadata.is_file() {
-        return None;
+        return Ok(None);
     }
 
-    match name {
+    Ok(match name {
         ".DS_Store" | "Thumbs.db" | "desktop.ini" => Some("system".into()),
-        _ => match ext {
-            "tmp" | "temp" | "swp" | "swo" | "bak" | "log" => Some("temp/log".into()),
-            "cargo" | "gradle" | "hex" | "vcpkg" | "snap" | "pacman" | "winget" => None,
-            _ => None,
-        },
+        _ if include_files && matches!(ext, "tmp" | "temp" | "swp" | "swo" | "bak" | "log") => {
+            Some("temp/log".into())
+        }
+        _ => None,
+    })
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    let mut size = 0;
+    for entry in WalkDir::new(path) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            size += entry.metadata()?.len();
+        }
     }
+    Ok(size)
 }
 
-fn dir_size(path: &Path) -> u64 {
-    WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-        .sum()
-}
-
-fn scan(dir: &str) -> Result<Vec<JunkFile>> {
+fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
     let mut junk = Vec::new();
+    let mut skipped = 0;
     let mut entries = WalkDir::new(dir).into_iter();
     while let Some(entry) = entries.next() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) if error.depth() == 0 => return Err(error.into()),
             Err(error) => {
+                skipped += 1;
                 eprintln!("  {} inaccessible path: {}", "skipped".yellow(), error);
                 continue;
             }
         };
-        if let Some(category) = is_junk(entry.path()) {
+        let category = match is_junk(entry.path(), include_files) {
+            Ok(category) => category,
+            Err(error) => {
+                skipped += 1;
+                eprintln!(
+                    "  {} cannot inspect {}: {error}",
+                    "skipped".yellow(),
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if let Some(category) = category {
             let size = if entry.file_type().is_dir() {
                 dir_size(entry.path())
             } else {
-                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                entry
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .map_err(Into::into)
+            };
+            let size = match size {
+                Ok(size) => size,
+                Err(error) => {
+                    skipped += 1;
+                    eprintln!(
+                        "  {} cannot size {}: {error}",
+                        "skipped".yellow(),
+                        entry.path().display()
+                    );
+                    if entry.file_type().is_dir() {
+                        entries.skip_current_dir();
+                    }
+                    continue;
+                }
             };
             junk.push(JunkFile {
                 path: entry.path().to_path_buf(),
@@ -180,7 +223,10 @@ fn scan(dir: &str) -> Result<Vec<JunkFile>> {
         }
     }
     junk.sort_by_key(|item| std::cmp::Reverse(item.size));
-    Ok(junk)
+    Ok(ScanResult {
+        items: junk,
+        skipped,
+    })
 }
 
 fn home_dir() -> PathBuf {
@@ -283,19 +329,27 @@ fn is_safe_cache_path(tool: &str, path: &Path) -> bool {
         return false;
     }
 
-    let Ok(metadata) = fs::symlink_metadata(path) else {
+    // Compare the resolved target with the expected cache shape, and reject
+    // symlinks in every component. This also accepts Windows paths whose
+    // canonical form has an extended-length prefix.
+    if path.ancestors().any(|part| {
+        fs::symlink_metadata(part)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true)
+    }) || path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
         return false;
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    }
+
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
         return false;
     }
 
     let Ok(canonical) = path.canonicalize() else {
         return false;
     };
-    if canonical != path {
-        return false;
-    }
     if is_protected_path(&canonical) || !has_expected_cache_shape(tool, &canonical) {
         return false;
     }
@@ -530,10 +584,6 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 vec![]
             }
         }
-        "docker" => {
-            // /var/lib/docker includes live data and cannot be used as a reclaimable-size estimate.
-            vec![]
-        }
         "hex" => {
             let cache = env_path("HEX_HOME")
                 .unwrap_or_else(|| home.join(".hex"))
@@ -597,20 +647,28 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 vec![]
             }
         }
-        "flatpak" => {
-            // `flatpak uninstall --unused` manages installations, not a cache directory.
-            vec![]
-        }
         _ => vec![],
     }
 }
 
-fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
+fn scan_cache(tools: &[String]) -> Result<ScanResult> {
     let mut junk = Vec::new();
+    let mut skipped = 0;
     for tool in tools {
         for (dir, category) in get_cache_dirs(tool) {
             if is_safe_cache_path(tool, &dir) {
-                let size = dir_size(&dir);
+                let size = match dir_size(&dir) {
+                    Ok(size) => size,
+                    Err(error) => {
+                        skipped += 1;
+                        eprintln!(
+                            "  {} cannot size {}: {error}",
+                            "skipped".yellow(),
+                            dir.display()
+                        );
+                        continue;
+                    }
+                };
                 if size > 0 {
                     junk.push(JunkFile {
                         path: dir,
@@ -619,6 +677,7 @@ fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
                     });
                 }
             } else if dir.exists() {
+                skipped += 1;
                 eprintln!(
                     "  {} unsafe or unexpected {} path: {}",
                     "skipped".yellow(),
@@ -629,7 +688,10 @@ fn scan_cache(tools: &[String]) -> Result<Vec<JunkFile>> {
         }
     }
     junk.sort_by_key(|item| std::cmp::Reverse(item.size));
-    Ok(junk)
+    Ok(ScanResult {
+        items: junk,
+        skipped,
+    })
 }
 
 fn get_clean_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
@@ -665,18 +727,45 @@ enum CleanCommandResult {
     Failed,
 }
 
+fn command_available(cmd: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        #[cfg(windows)]
+        {
+            [".exe", ".com", ".bat", ".cmd"]
+                .iter()
+                .any(|ext| dir.join(format!("{cmd}{ext}")).is_file())
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let candidate = dir.join(cmd);
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        }
+    })
+}
+
 fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
     let Some((cmd, args)) = get_clean_cmd(tool) else {
         return Ok(CleanCommandResult::Unavailable);
     };
     if dry_run {
+        if !command_available(cmd) {
+            println!("  {} command unavailable: {cmd}", "[dry-run]".yellow());
+            return Ok(CleanCommandResult::Unavailable);
+        }
         println!("  {} {} {}", "[dry-run]".yellow(), cmd, args.join(" "));
         return Ok(CleanCommandResult::Success);
     }
     let output = match Command::new(cmd).args(&args).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("  {} command not found: {cmd}", "fallback".yellow());
+            println!("  {} command not found: {cmd}", "skipped".yellow());
             return Ok(CleanCommandResult::Unavailable);
         }
         Err(error) => return Err(error.into()),
@@ -709,7 +798,8 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
 
 fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
     let mut cleaned = 0u64;
-    let mut command_failed = false;
+    let mut planned = 0u64;
+    let mut had_failure = false;
     let mut cmd_cleaned = std::collections::HashSet::new();
     for item in junk {
         let tool = item.category.split_whitespace().next().unwrap_or("");
@@ -717,13 +807,31 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
             if cmd_cleaned.insert(tool.to_string()) {
                 match run_clean_cmd(tool, dry_run)? {
                     CleanCommandResult::Success => {
-                        if !dry_run {
-                            cleaned += reclaimed_by_command(junk, tool);
+                        if dry_run {
+                            planned += junk
+                                .iter()
+                                .filter(|entry| {
+                                    entry.category.split_whitespace().next() == Some(tool)
+                                })
+                                .map(|entry| entry.size)
+                                .sum::<u64>();
+                        } else {
+                            match reclaimed_by_command(junk, tool) {
+                                Ok(bytes) => cleaned += bytes,
+                                Err(error) => {
+                                    had_failure = true;
+                                    eprintln!(
+                                        "  {} cannot measure {} after cleanup: {error}",
+                                        "warning".yellow(),
+                                        tool
+                                    );
+                                }
+                            }
                         }
                         continue;
                     }
                     CleanCommandResult::Failed => {
-                        command_failed = true;
+                        had_failure = true;
                         println!(
                             "  {} {} cache after command failure",
                             "skipped".yellow(),
@@ -732,7 +840,8 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                         continue;
                     }
                     CleanCommandResult::Unavailable => {
-                        cmd_cleaned.remove(tool);
+                        had_failure = true;
+                        continue;
                     }
                 }
             } else {
@@ -740,6 +849,7 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
             }
         }
         if dry_run {
+            planned += item.size;
             println!(
                 "  {} remove directory recursively: {}",
                 "[dry-run]".yellow(),
@@ -747,6 +857,7 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
             );
         } else {
             if !is_safe_cache_path(tool, &item.path) {
+                had_failure = true;
                 println!(
                     "  {} unsafe or changed path: {}",
                     "skipped".yellow(),
@@ -761,6 +872,7 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                     println!("  {} {}", "removed".green(), item.path.display());
                 }
                 Err(e) => {
+                    had_failure = true;
                     println!("  {} {} ({})", "failed".red(), item.path.display(), e);
                 }
             }
@@ -769,35 +881,33 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
 
     if dry_run {
         println!(
-            "\n{} Dry run complete. {} would be freed.",
+            "\n{} Dry run complete. Approximately {} of matched content would be removed.",
             "Done!".bold().cyan(),
-            format_size(junk.iter().map(|j| j.size).sum::<u64>()).yellow()
+            format_size(planned).yellow()
         );
     } else {
         println!(
-            "\n{} Cleaned up {} of disk space.",
+            "\n{} Removed approximately {} of matched content.",
             "Done!".bold().green(),
             format_size(cleaned).yellow()
         );
     }
-    if command_failed {
-        anyhow::bail!(
-            "one or more native cleanup commands failed; their caches were left untouched"
-        );
+    if had_failure {
+        anyhow::bail!("one or more cache cleanup items failed or were skipped");
     }
     Ok(())
 }
 
-fn reclaimed_by_command(junk: &[JunkFile], tool: &str) -> u64 {
+fn reclaimed_by_command(junk: &[JunkFile], tool: &str) -> Result<u64> {
     junk.iter()
         .filter(|item| item.category.split_whitespace().next() == Some(tool))
         .map(|item| {
             let remaining = if item.path.is_dir() {
-                dir_size(&item.path)
+                dir_size(&item.path)?
             } else {
                 0
             };
-            item.size.saturating_sub(remaining)
+            Ok(item.size.saturating_sub(remaining))
         })
         .sum()
 }
@@ -822,7 +932,7 @@ fn display_results(junk: &[JunkFile], show_all: bool) {
 
     let total: u64 = junk.iter().map(|j| j.size).sum();
     println!(
-        "\n{} Found {} items totaling {}\n",
+        "\n{} Found {} items totaling approximately {} of matched content\n",
         "Scan Results:".bold().cyan(),
         junk.len().to_string().yellow(),
         format_size(total).red().bold()
@@ -861,7 +971,7 @@ fn display_results(junk: &[JunkFile], show_all: bool) {
 
     println!(
         "\n  {} {}",
-        "Total reclaimable:".bold(),
+        "Total matched size:".bold(),
         format_size(total).red().bold()
     );
 }
@@ -877,8 +987,9 @@ fn truncate_path(path: &str, max_chars: usize) -> String {
     format!("...{suffix}")
 }
 
-fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
+fn clean(junk: &[JunkFile], dry_run: bool, include_files: bool) -> Result<()> {
     let mut cleaned = 0u64;
+    let mut had_failure = false;
     for item in junk {
         if dry_run {
             println!("  {} {}", "[dry-run]".yellow(), item.path.display());
@@ -886,6 +997,7 @@ fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
             let metadata = match fs::symlink_metadata(&item.path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    had_failure = true;
                     println!(
                         "  {} {} ({})",
                         "skipped".yellow(),
@@ -896,10 +1008,13 @@ fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                 }
             };
             if metadata.file_type().is_symlink() {
+                had_failure = true;
                 println!("  {} symlink: {}", "skipped".yellow(), item.path.display());
                 continue;
             }
-            if is_junk(&item.path).as_deref() != Some(item.category.as_str()) {
+            if !matches!(is_junk(&item.path, include_files), Ok(Some(category)) if category == item.category)
+            {
+                had_failure = true;
                 println!(
                     "  {} changed path: {}",
                     "skipped".yellow(),
@@ -918,6 +1033,7 @@ fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                     println!("  {} {}", "removed".green(), item.path.display());
                 }
                 Err(e) => {
+                    had_failure = true;
                     println!("  {} {} ({})", "failed".red(), item.path.display(), e);
                 }
             }
@@ -926,16 +1042,19 @@ fn clean(junk: &[JunkFile], dry_run: bool) -> Result<()> {
 
     if dry_run {
         println!(
-            "\n{} Dry run complete. {} would be freed.",
+            "\n{} Dry run complete. Approximately {} of matched content would be removed.",
             "Done!".bold().cyan(),
             format_size(junk.iter().map(|j| j.size).sum::<u64>()).yellow()
         );
     } else {
         println!(
-            "\n{} Cleaned up {} of disk space.",
+            "\n{} Removed approximately {} of matched content.",
             "Done!".bold().green(),
             format_size(cleaned).yellow()
         );
+    }
+    if had_failure {
+        anyhow::bail!("one or more cleanup items failed or were skipped");
     }
     Ok(())
 }
@@ -944,19 +1063,35 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Scan { path } => {
+        Commands::Scan {
+            path,
+            include_files,
+        } => {
             println!("{} {}", "Scanning".bold().cyan(), path);
-            let junk = scan(&path)?;
-            display_results(&junk, false);
+            let result = scan(&path, include_files)?;
+            display_results(&result.items, false);
+            if result.skipped > 0 {
+                anyhow::bail!("scan incomplete: {} paths were skipped", result.skipped);
+            }
         }
-        Commands::Clean { path, dry_run } => {
+        Commands::Clean {
+            path,
+            include_files,
+            dry_run,
+        } => {
             println!("{} {}", "Scanning".bold().cyan(), path);
-            let junk = scan(&path)?;
-            if junk.is_empty() {
+            let result = scan(&path, include_files)?;
+            if result.items.is_empty() && result.skipped == 0 {
                 println!("{}", "Nothing to clean.".green());
                 return Ok(());
             }
-            display_results(&junk, true);
+            display_results(&result.items, true);
+            if result.skipped > 0 {
+                anyhow::bail!(
+                    "scan incomplete: {} paths were skipped; cleanup cancelled",
+                    result.skipped
+                );
+            }
 
             if !dry_run {
                 println!(
@@ -971,11 +1106,16 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            clean(&junk, dry_run)?;
+            clean(&result.items, dry_run, include_files)?;
         }
         Commands::Cache { tool, dry_run } => {
             let tools = match tool {
                 Some(t) if SUPPORTED_TOOLS.contains(&t.as_str()) => vec![t],
+                Some(t) if matches!(t.as_str(), "docker" | "flatpak") => {
+                    anyhow::bail!(
+                        "{t} requires manual cleanup and is not supported by the cache command"
+                    )
+                }
                 Some(t) => anyhow::bail!(
                     "unsupported tool '{t}'; supported tools: {}",
                     SUPPORTED_TOOLS.join(", ")
@@ -988,12 +1128,18 @@ fn main() -> Result<()> {
                 "Scanning caches for:".bold().cyan(),
                 tools.join(", ")
             );
-            let junk = scan_cache(&tools)?;
-            if junk.is_empty() {
+            let result = scan_cache(&tools)?;
+            if result.items.is_empty() && result.skipped == 0 {
                 println!("{}", "No caches found.".green());
                 return Ok(());
             }
-            display_results(&junk, true);
+            display_results(&result.items, true);
+            if result.skipped > 0 {
+                anyhow::bail!(
+                    "cache scan incomplete: {} paths were skipped; cleanup cancelled",
+                    result.skipped
+                );
+            }
 
             if !dry_run {
                 println!(
@@ -1008,7 +1154,7 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            clean_cache(&junk, dry_run)?;
+            clean_cache(&result.items, dry_run)?;
         }
     }
 
@@ -1027,6 +1173,8 @@ mod tests {
                 "unexpected command for {tool}"
             );
         }
+        assert!(!SUPPORTED_TOOLS.contains(&"docker"));
+        assert!(!SUPPORTED_TOOLS.contains(&"flatpak"));
     }
 
     #[test]
@@ -1063,7 +1211,49 @@ mod tests {
             category: "npm cache".into(),
         }];
 
-        assert_eq!(reclaimed_by_command(&junk, "npm"), 75);
+        assert_eq!(reclaimed_by_command(&junk, "npm").unwrap(), 75);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_size_is_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "disk-cleaner-missing-size-test-{}",
+            std::process::id()
+        ));
+        assert!(dir_size(&missing).is_err());
+    }
+
+    #[test]
+    fn missing_cleanup_target_is_reported_as_failure() {
+        let missing = std::env::temp_dir().join(format!(
+            "disk-cleaner-missing-clean-test-{}",
+            std::process::id()
+        ));
+        let junk = vec![JunkFile {
+            path: missing,
+            size: 1,
+            category: "system".into(),
+        }];
+        assert!(clean(&junk, false, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_path_with_symlinked_parent_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("disk-cleaner-symlink-test-{}", std::process::id()));
+        let real = root.join("real");
+        fs::create_dir_all(real.join("cache")).unwrap();
+        symlink(&real, root.join("alias")).unwrap();
+
+        assert!(is_safe_cache_path("npm", &real.join("cache")));
+        assert!(!is_safe_cache_path("npm", &root.join("alias/cache")));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1105,10 +1295,12 @@ mod tests {
         fs::write(target.join("debug/artifact.bin"), vec![0u8; 128]).unwrap();
         fs::write(root.join("notes.log"), vec![0u8; 7]).unwrap();
 
-        let results = scan(root.to_str().unwrap()).unwrap();
-        assert_eq!(results.len(), 2);
+        let results = scan(root.to_str().unwrap(), true).unwrap();
+        assert_eq!(results.skipped, 0);
+        assert_eq!(results.items.len(), 2);
         assert_eq!(
             results
+                .items
                 .iter()
                 .find(|item| item.path == target)
                 .map(|item| item.size),
@@ -1116,6 +1308,7 @@ mod tests {
         );
         assert!(
             !results
+                .items
                 .iter()
                 .any(|item| item.path.ends_with("artifact.bin"))
         );
