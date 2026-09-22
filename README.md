@@ -47,7 +47,7 @@ disk-cleaner clean --path /home/user --include-files --dry-run
 # Scan all tool caches
 disk-cleaner cache --dry-run
 
-# Clean all tool caches
+# Review all supported tool caches and confirm cleanup
 disk-cleaner cache
 
 # Clean specific tool
@@ -58,6 +58,8 @@ disk-cleaner cache --tool cargo --dry-run
 ## Supported Tools
 
 Cache cleanup uses native commands where defined. Directory deletion is used only for tools without a native command. If a command is unavailable or fails, that tool's cache is left untouched and the command exits with an error.
+
+`cache --dry-run` checks whether native commands are available and shows the action planned for each detected cache. A missing command is marked as skipped; it is never replaced with directory deletion. A native command may also clean other caches managed by that tool beyond the paths shown in the scan.
 
 | Category | Tools | Cleanup Method |
 |----------|-------|----------------|
@@ -89,7 +91,9 @@ Docker and Flatpak are not supported by `cache`; use their own tools for manual 
 | system      | `.DS_Store`, `Thumbs.db`, `desktop.ini`   |
 | temp/log (opt-in) | `*.tmp`, `*.bak`, `*.log`, `*.swp`        |
 
-`build`, `dist`, `.cache`, `.npm`, and `.yarn` directories are not automatically classified as junk by directory scanning. Review every path shown by `clean` before confirming deletion. Reported sizes are estimates based on file lengths, not measured free disk space.
+`build`, `dist`, `.cache`, `.npm`, and `.yarn` directories are not automatically classified as junk by directory scanning. `scan` shows the 50 largest matches; `clean` shows every full path before confirmation. If any path cannot be inspected or sized, the scan exits with an error and cleanup does not start.
+
+Reported sizes are estimates based on file lengths, not measured free disk space. If an individual deletion fails, the command reports an error and exits nonzero; earlier successful deletions are not rolled back.
 
 ## License
 
