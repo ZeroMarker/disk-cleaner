@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
-#[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +49,33 @@ fn clean_preview_shows_every_full_path_before_cleanup() {
     let preview = stdout.split("  [dry-run]").next().unwrap();
     assert_eq!(preview.matches(".log").count(), 51);
     assert!(preview.contains(&root.0.join(long_name).display().to_string()));
+}
+
+#[test]
+fn confirmed_clean_removes_only_listed_junk() {
+    use std::io::Write;
+
+    let root = TestDir::new();
+    let junk = root.0.join("notes.log");
+    let keep = root.0.join("notes.txt");
+    fs::write(&junk, b"remove").unwrap();
+    fs::write(&keep, b"keep").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disk-cleaner"))
+        .args([
+            "clean",
+            "--path",
+            root.0.to_str().unwrap(),
+            "--include-files",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(!junk.exists());
+    assert!(keep.exists());
 }
 
 #[test]
@@ -152,6 +177,30 @@ fn configured_cache_directory_is_accepted() {
             .unwrap()
             .contains(&downloads.display().to_string())
     );
+}
+
+#[test]
+fn confirmed_cache_cleanup_removes_configured_directory() {
+    use std::io::Write;
+
+    let root = TestDir::new();
+    let downloads = root.0.join("downloads");
+    fs::create_dir(&downloads).unwrap();
+    fs::write(downloads.join("archive.bin"), b"cache").unwrap();
+    let keep = root.0.join("installed.bin");
+    fs::write(&keep, b"keep").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_disk-cleaner"))
+        .args(["cache", "--tool", "vcpkg"])
+        .env("VCPKG_ROOT", &root.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(!downloads.exists());
+    assert!(keep.exists());
 }
 
 #[cfg(unix)]

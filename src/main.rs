@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::fs;
-use std::fs::FileType;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use same_file::Handle;
 use walkdir::WalkDir;
 
 const SUPPORTED_TOOLS: &[&str] = &[
@@ -109,14 +112,15 @@ struct JunkFile {
 struct ScanResult {
     items: Vec<JunkFile>,
     skipped: usize,
+    cache_parents: HashMap<PathBuf, Dir>,
 }
 
-fn is_junk(path: &Path, file_type: FileType, include_files: bool) -> Option<&'static str> {
+fn is_junk(path: &Path, is_dir: bool, is_file: bool, include_files: bool) -> Option<&'static str> {
     let name = path.file_name().and_then(|name| name.to_str())?;
 
     // WalkDir supplies the file type without another metadata lookup. It does
     // not follow symlinks, so links cannot become cleanup targets.
-    if file_type.is_dir() {
+    if is_dir {
         match name {
             "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".gradle" => {
                 return Some("cache/build");
@@ -132,7 +136,7 @@ fn is_junk(path: &Path, file_type: FileType, include_files: bool) -> Option<&'st
         }
     }
 
-    if !file_type.is_file() {
+    if !is_file {
         return None;
     }
 
@@ -175,7 +179,12 @@ fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
                 continue;
             }
         };
-        let category = is_junk(entry.path(), entry.file_type(), include_files);
+        let category = is_junk(
+            entry.path(),
+            entry.file_type().is_dir(),
+            entry.file_type().is_file(),
+            include_files,
+        );
         if let Some(category) = category {
             let size = if entry.file_type().is_dir() {
                 dir_size(entry.path())
@@ -219,7 +228,23 @@ fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
     Ok(ScanResult {
         items: junk,
         skipped,
+        cache_parents: HashMap::new(),
     })
+}
+
+fn points_to_open_dir(path: &Path, dir: &Dir) -> Result<bool> {
+    let opened = Handle::from_file(dir.try_clone()?.into_std_file())?;
+    Ok(opened == Handle::from_path(path)?)
+}
+
+fn has_symlink_parent(root: &Dir, relative: &Path) -> Result<bool> {
+    for parent in relative.parent().into_iter().flat_map(Path::ancestors) {
+        if !parent.as_os_str().is_empty() && root.symlink_metadata(parent)?.file_type().is_symlink()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn home_dir() -> PathBuf {
@@ -317,8 +342,50 @@ fn has_expected_cache_shape(tool: &str, path: &Path) -> bool {
     }
 }
 
+fn is_expected_manual_cache_path(tool: &str, path: &Path) -> bool {
+    let home = home_dir();
+    match tool {
+        "cargo" => {
+            let root = env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+            path == root.join("registry") || path == root.join("git")
+        }
+        "gem" => {
+            let root = env_path("GEM_HOME")
+                .or_else(|| command_path("gem", &["env", "home"]))
+                .unwrap_or_else(|| home.join(".gem"));
+            path == root.join("cache")
+        }
+        "maven" => {
+            path == env_path("MAVEN_REPO_LOCAL").unwrap_or_else(|| home.join(".m2/repository"))
+        }
+        "gradle" => {
+            let root = env_path("GRADLE_USER_HOME").unwrap_or_else(|| home.join(".gradle"));
+            path == root.join("caches")
+        }
+        "hex" => {
+            let root = env_path("HEX_HOME").unwrap_or_else(|| home.join(".hex"));
+            path == root.join("packages")
+        }
+        "snap" => path == Path::new("/var/lib/snapd/cache"),
+        "pacman" => path == Path::new("/var/cache/pacman/pkg"),
+        "winget" => env_path("LOCALAPPDATA").is_some_and(|root| path == root.join("Temp/WinGet")),
+        "vcpkg" => {
+            let root =
+                env_path("VCPKG_ROOT").unwrap_or_else(|| PathBuf::from("/usr/local/share/vcpkg"));
+            ["buildtrees", "downloads", "packages"]
+                .iter()
+                .any(|name| path == root.join(name))
+        }
+        _ => true,
+    }
+}
+
 fn is_safe_cache_path(tool: &str, path: &Path) -> bool {
-    if !SUPPORTED_TOOLS.contains(&tool) || !path.is_absolute() || is_protected_path(path) {
+    if !SUPPORTED_TOOLS.contains(&tool)
+        || !path.is_absolute()
+        || is_protected_path(path)
+        || !is_expected_manual_cache_path(tool, path)
+    {
         return false;
     }
 
@@ -647,9 +714,35 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
 fn scan_cache(tools: &[String]) -> Result<ScanResult> {
     let mut junk = Vec::new();
     let mut skipped = 0;
+    let mut cache_parents = HashMap::new();
     for tool in tools {
         for (dir, category) in get_cache_dirs(tool) {
             if is_safe_cache_path(tool, &dir) {
+                let parent = if get_clean_cmd(tool).is_none() {
+                    let Some(parent_path) = dir.parent() else {
+                        skipped += 1;
+                        continue;
+                    };
+                    match Dir::open_ambient_dir(parent_path, ambient_authority()) {
+                        Ok(parent)
+                            if points_to_open_dir(parent_path, &parent).unwrap_or(false)
+                                && is_safe_cache_path(tool, &dir) =>
+                        {
+                            Some(parent)
+                        }
+                        _ => {
+                            skipped += 1;
+                            eprintln!(
+                                "  {} changed cache parent: {}",
+                                "skipped".yellow(),
+                                parent_path.display()
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let size = match dir_size(&dir) {
                     Ok(size) => size,
                     Err(error) => {
@@ -663,6 +756,9 @@ fn scan_cache(tools: &[String]) -> Result<ScanResult> {
                     }
                 };
                 if size > 0 {
+                    if let Some(parent) = parent {
+                        cache_parents.insert(dir.clone(), parent);
+                    }
                     junk.push(JunkFile {
                         path: dir,
                         size,
@@ -685,6 +781,7 @@ fn scan_cache(tools: &[String]) -> Result<ScanResult> {
     Ok(ScanResult {
         items: junk,
         skipped,
+        cache_parents,
     })
 }
 
@@ -790,7 +887,11 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
     }
 }
 
-fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
+fn clean_cache(
+    junk: &[JunkFile],
+    dry_run: bool,
+    cache_parents: &HashMap<PathBuf, Dir>,
+) -> Result<()> {
     for item in junk {
         let Some(tool) = item.tool.as_deref() else {
             anyhow::bail!("cache item has no tool identity: {}", item.path.display());
@@ -869,7 +970,11 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
                 );
                 continue;
             }
-            let res = fs::remove_dir_all(&item.path);
+            let res = cache_parents
+                .get(&item.path)
+                .zip(item.path.file_name())
+                .ok_or_else(|| anyhow::anyhow!("missing validated parent: {}", item.path.display()))
+                .and_then(|(parent, name)| Ok(parent.remove_dir_all(name)?));
             match res {
                 Ok(_) => {
                     cleaned += item.size;
@@ -885,13 +990,13 @@ fn clean_cache(junk: &[JunkFile], dry_run: bool) -> Result<()> {
 
     if dry_run {
         println!(
-            "\n{} Dry run complete. Approximately {} of matched content would be removed.",
+            "\n{} Dry run complete. Approximately {} of matched content would be removed. Native commands may clean a different amount.",
             "Done!".bold().cyan(),
             format_size(planned).yellow()
         );
     } else {
         println!(
-            "\n{} Removed approximately {} of matched content.",
+            "\n{} Approximately {} of matched content removed. Free disk space was not measured.",
             "Done!".bold().green(),
             format_size(cleaned).yellow()
         );
@@ -991,14 +1096,41 @@ fn truncate_path(path: &str, max_chars: usize) -> String {
     format!("...{suffix}")
 }
 
-fn clean(junk: &[JunkFile], dry_run: bool, include_files: bool) -> Result<()> {
+fn clean(
+    junk: &[JunkFile],
+    dry_run: bool,
+    include_files: bool,
+    root: &Dir,
+    scan_path: &Path,
+) -> Result<()> {
     let mut cleaned = 0u64;
     let mut had_failure = false;
     for item in junk {
         if dry_run {
             println!("  {} {}", "[dry-run]".yellow(), item.path.display());
         } else {
-            let metadata = match fs::symlink_metadata(&item.path) {
+            let relative = match item.path.strip_prefix(scan_path) {
+                Ok(relative) if !relative.as_os_str().is_empty() => relative,
+                _ => {
+                    had_failure = true;
+                    println!(
+                        "  {} outside scan root: {}",
+                        "skipped".yellow(),
+                        item.path.display()
+                    );
+                    continue;
+                }
+            };
+            if !matches!(has_symlink_parent(root, relative), Ok(false)) {
+                had_failure = true;
+                println!(
+                    "  {} changed parent path: {}",
+                    "skipped".yellow(),
+                    item.path.display()
+                );
+                continue;
+            }
+            let metadata = match root.symlink_metadata(relative) {
                 Ok(metadata) => metadata,
                 Err(error) => {
                     had_failure = true;
@@ -1016,8 +1148,12 @@ fn clean(junk: &[JunkFile], dry_run: bool, include_files: bool) -> Result<()> {
                 println!("  {} symlink: {}", "skipped".yellow(), item.path.display());
                 continue;
             }
-            if is_junk(&item.path, metadata.file_type(), include_files)
-                != Some(item.category.as_str())
+            if is_junk(
+                &item.path,
+                metadata.is_dir(),
+                metadata.is_file(),
+                include_files,
+            ) != Some(item.category.as_str())
             {
                 had_failure = true;
                 println!(
@@ -1028,9 +1164,9 @@ fn clean(junk: &[JunkFile], dry_run: bool, include_files: bool) -> Result<()> {
                 continue;
             }
             let res = if metadata.is_dir() {
-                fs::remove_dir_all(&item.path)
+                root.remove_dir_all(relative)
             } else {
-                fs::remove_file(&item.path)
+                root.remove_file(relative)
             };
             match res {
                 Ok(_) => {
@@ -1085,7 +1221,11 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             println!("{} {}", "Scanning".bold().cyan(), path);
+            let root = Dir::open_ambient_dir(&path, ambient_authority())?;
             let result = scan(&path, include_files)?;
+            if !points_to_open_dir(Path::new(&path), &root)? {
+                anyhow::bail!("scan root changed during scan; cleanup cancelled");
+            }
             if result.items.is_empty() && result.skipped == 0 {
                 println!("{}", "Nothing to clean.".green());
                 return Ok(());
@@ -1111,7 +1251,16 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            clean(&result.items, dry_run, include_files)?;
+            if !points_to_open_dir(Path::new(&path), &root)? {
+                anyhow::bail!("scan root changed before cleanup; cleanup cancelled");
+            }
+            clean(
+                &result.items,
+                dry_run,
+                include_files,
+                &root,
+                Path::new(&path),
+            )?;
         }
         Commands::Cache { tool, dry_run } => {
             let tools = match tool {
@@ -1159,7 +1308,7 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            clean_cache(&result.items, dry_run)?;
+            clean_cache(&result.items, dry_run, &result.cache_parents)?;
         }
     }
 
@@ -1243,7 +1392,85 @@ mod tests {
             category: "system".into(),
             tool: None,
         }];
-        assert!(clean(&junk, false, false).is_err());
+        let root = Dir::open_ambient_dir(std::env::temp_dir(), ambient_authority()).unwrap();
+        assert!(clean(&junk, false, false, &root, &std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn clean_reports_partial_failure_after_removing_valid_item() {
+        let root =
+            std::env::temp_dir().join(format!("disk-cleaner-partial-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let removable = root.join("remove.log");
+        fs::write(&removable, b"remove").unwrap();
+        let result = scan(root.to_str().unwrap(), true).unwrap();
+        let mut items = result.items;
+        items.push(JunkFile {
+            path: root.join("missing.log"),
+            size: 1,
+            category: "temp/log".into(),
+            tool: None,
+        });
+        let opened = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+
+        assert!(clean(&items, false, true, &opened, &root).is_err());
+        assert!(!removable.exists());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_scan_parent_cannot_redirect_deletion_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("disk-cleaner-parent-test-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(root.join("project")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(root.join("project/notes.log"), b"original").unwrap();
+        fs::write(outside.join("notes.log"), b"keep").unwrap();
+        let opened = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let items = scan(root.to_str().unwrap(), true).unwrap().items;
+        fs::rename(root.join("project"), root.join("project-old")).unwrap();
+        symlink(&outside, root.join("project")).unwrap();
+
+        assert!(clean(&items, false, true, &opened, &root).is_err());
+        assert_eq!(fs::read(outside.join("notes.log")).unwrap(), b"keep");
+        assert!(root.join("project-old/notes.log").exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moved_scan_root_is_detected() {
+        let base = std::env::temp_dir().join(format!(
+            "disk-cleaner-root-change-test-{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        let moved = base.join("moved");
+        fs::create_dir_all(&root).unwrap();
+        let opened = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert!(!points_to_open_dir(&root, &opened).unwrap());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn manual_cache_path_requires_configured_location() {
+        let unexpected = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join("app/repository");
+        assert!(!is_expected_manual_cache_path("maven", &unexpected));
+        assert!(!is_expected_manual_cache_path(
+            "vcpkg",
+            &unexpected.with_file_name("downloads")
+        ));
     }
 
     #[cfg(unix)]
@@ -1324,7 +1551,7 @@ mod tests {
                 tool: None,
             },
         ];
-        assert!(clean_cache(&junk, false).is_err());
+        assert!(clean_cache(&junk, false, &HashMap::new()).is_err());
         assert!(marker.exists());
         assert!(registry_marker.exists());
 

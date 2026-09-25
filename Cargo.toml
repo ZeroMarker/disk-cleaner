@@ -10,3 +10,5 @@ clap = { version = "4", features = ["derive"] }
 walkdir = "2"
 colored = "3"
 anyhow = "1"
+cap-std = "4"
+same-file = "1"

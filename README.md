@@ -59,7 +59,7 @@ disk-cleaner cache --tool cargo --dry-run
 
 Cache cleanup uses native commands where defined. Directory deletion is used only for tools without a native command. If a command is unavailable or fails, that tool's cache is left untouched and the command exits with an error.
 
-`cache --dry-run` checks whether native commands are available and shows the action planned for each detected cache. A missing command is marked as skipped; it is never replaced with directory deletion. A native command may also clean other caches managed by that tool beyond the paths shown in the scan.
+`cache --dry-run` checks whether native commands are available and shows the action planned for each detected cache. A missing command is marked as skipped; it is never replaced with directory deletion. The displayed size is the logical size of matched paths, not a promise of reclaimed disk space. A native command may clean other caches managed by that tool beyond the paths shown in the scan, and may leave some matched content in place.
 
 | Category | Tools | Cleanup Method |
 |----------|-------|----------------|
@@ -94,6 +94,10 @@ Docker and Flatpak are not supported by `cache`; use their own tools for manual 
 `build`, `dist`, `.cache`, `.npm`, and `.yarn` directories are not automatically classified as junk by directory scanning. `scan` shows the 50 largest matches; `clean` shows every full path before confirmation. If any path cannot be inspected or sized, the scan exits with an error and cleanup does not start.
 
 Reported sizes are estimates based on file lengths, not measured free disk space. If an individual deletion fails, the command reports an error and exits nonzero; earlier successful deletions are not rolled back.
+
+## Scan Benchmark
+
+On Linux or macOS, run `scripts/benchmark-scan.sh [file-count]` to time a release build scanning a temporary tree. The default is 10,000 ordinary files plus 1,000 files inside a matched `node_modules` directory. Run the same count on both revisions when comparing scan performance; timing is intentionally excluded from CI because it depends on the machine and filesystem.
 
 ## License
 
