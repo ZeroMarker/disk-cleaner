@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::FileType;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -110,42 +111,43 @@ struct ScanResult {
     skipped: usize,
 }
 
-fn is_junk(path: &Path, include_files: bool) -> Result<Option<String>> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(None);
-    };
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+fn is_junk(path: &Path, file_type: FileType, include_files: bool) -> Option<&'static str> {
+    let name = path.file_name().and_then(|name| name.to_str())?;
 
-    // Never classify symlinked directories as cleanup targets. A symlink can
-    // point outside the scanned tree and must not become a recursive delete.
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
+    // WalkDir supplies the file type without another metadata lookup. It does
+    // not follow symlinks, so links cannot become cleanup targets.
+    if file_type.is_dir() {
         match name {
             "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".gradle" => {
-                return Ok(Some("cache/build".into()));
+                return Some("cache/build");
             }
             "target"
                 if path
                     .parent()
                     .is_some_and(|parent| parent.join("Cargo.toml").is_file()) =>
             {
-                return Ok(Some("cache/build".into()));
+                return Some("cache/build");
             }
             _ => {}
         }
     }
 
-    if !metadata.is_file() {
-        return Ok(None);
+    if !file_type.is_file() {
+        return None;
     }
 
-    Ok(match name {
-        ".DS_Store" | "Thumbs.db" | "desktop.ini" => Some("system".into()),
-        _ if include_files && matches!(ext, "tmp" | "temp" | "swp" | "swo" | "bak" | "log") => {
-            Some("temp/log".into())
+    match name {
+        ".DS_Store" | "Thumbs.db" | "desktop.ini" => Some("system"),
+        _ if include_files
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("tmp" | "temp" | "swp" | "swo" | "bak" | "log")
+            ) =>
+        {
+            Some("temp/log")
         }
         _ => None,
-    })
+    }
 }
 
 fn dir_size(path: &Path) -> Result<u64> {
@@ -173,18 +175,7 @@ fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
                 continue;
             }
         };
-        let category = match is_junk(entry.path(), include_files) {
-            Ok(category) => category,
-            Err(error) => {
-                skipped += 1;
-                eprintln!(
-                    "  {} cannot inspect {}: {error}",
-                    "skipped".yellow(),
-                    entry.path().display()
-                );
-                continue;
-            }
-        };
+        let category = is_junk(entry.path(), entry.file_type(), include_files);
         if let Some(category) = category {
             let size = if entry.file_type().is_dir() {
                 dir_size(entry.path())
@@ -212,7 +203,7 @@ fn scan(dir: &str, include_files: bool) -> Result<ScanResult> {
             junk.push(JunkFile {
                 path: entry.path().to_path_buf(),
                 size,
-                category,
+                category: category.into(),
                 tool: None,
             });
 
@@ -1025,7 +1016,8 @@ fn clean(junk: &[JunkFile], dry_run: bool, include_files: bool) -> Result<()> {
                 println!("  {} symlink: {}", "skipped".yellow(), item.path.display());
                 continue;
             }
-            if !matches!(is_junk(&item.path, include_files), Ok(Some(category)) if category == item.category)
+            if is_junk(&item.path, metadata.file_type(), include_files)
+                != Some(item.category.as_str())
             {
                 had_failure = true;
                 println!(

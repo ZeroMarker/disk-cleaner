@@ -105,6 +105,35 @@ fn transient_files_require_explicit_opt_in() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn scan_does_not_follow_symlinked_junk() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestDir::new();
+    let outside = TestDir::new();
+    fs::create_dir(outside.0.join("dependencies")).unwrap();
+    fs::write(outside.0.join("notes.log"), b"keep").unwrap();
+    symlink(outside.0.join("dependencies"), root.0.join("node_modules")).unwrap();
+    symlink(outside.0.join("notes.log"), root.0.join("notes.log")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_disk-cleaner"))
+        .args([
+            "scan",
+            "--path",
+            root.0.to_str().unwrap(),
+            "--include-files",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("No junk files found.")
+    );
+}
+
 #[test]
 fn configured_cache_directory_is_accepted() {
     let root = TestDir::new();
