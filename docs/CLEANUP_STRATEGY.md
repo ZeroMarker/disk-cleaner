@@ -24,6 +24,8 @@
 
 默认不匹配通用 `.cache`、`.npm`、`.yarn`、`build` 或 `dist` 目录。`scan` 只展示最大的 50 项；`clean` 在确认前展示全部完整路径。扫描遇到无法检查或计算大小的路径时会返回错误，`clean` 不会继续执行。
 
+`scan` 和 `clean --dry-run` 都不会删除文件。执行 `clean` 时只有输入 `y` 才会开始清理，直接回车或输入其他内容会取消。确认后若扫描根目录被替换，或待删除路径的父目录变成符号链接，清理会取消或跳过，并返回非零状态。
+
 ### 排序规则
 
 结果按文件逻辑大小降序排列。该数字是内容大小估计值，不等于实际释放的磁盘空间。删除部分失败时命令返回非零状态；已成功删除的项目不会回滚。
@@ -36,7 +38,7 @@
 
 | 模式 | 命令 | 行为 |
 |------|------|------|
-| 预览 | `cache --dry-run` | 检查原生命令是否可用，展示计划操作，不执行删除 |
+| 预览 | `cache --dry-run` | 检查原生命令是否可用，展示计划操作，不执行删除；若已发现的缓存无法安全清理，返回非零状态 |
 | 执行 | `cache` | 展示后需用户确认 `y/N`，确认后执行清理 |
 
 ### 默认扫描范围
@@ -56,11 +58,11 @@ brew, mise, pacman, dnf, zypper, winget, vcpkg
 - **原生命令**：工具自行管理缓存清理，具体范围以工具行为为准
 - **目录删除**：直接删除缓存目录，下次使用时自动重建
 
-原生命令可能清理该工具管理的其他缓存，也可能保留部分扫描到的内容。预览大小代表匹配路径的文件逻辑大小；执行后的数字为匹配路径大小的估计变化，不是实际释放的磁盘空间。若部分工具清理成功而其他工具失败，命令返回非零状态，已成功的操作不会回滚。
+原生命令可能清理该工具管理的其他缓存，也可能保留部分扫描到的内容。预览大小代表匹配路径的文件逻辑大小；目录删除的执行结果使用扫描前大小，原生命令的执行结果使用命令前后匹配路径的大小差。两者都不是实际释放的磁盘空间。若部分工具清理成功而其他工具失败，命令返回非零状态，已成功的操作不会回滚。
 
 ### 路径安全校验
 
-扫描和实际删除前都会校验路径。目录扫描和直接删除缓存目录时，会从已打开的目录句柄执行相对路径删除。以下路径会被跳过：
+扫描和实际删除前都会校验路径。目录清理和直接删除缓存目录时，会从扫描阶段已打开的目录句柄执行相对路径删除。以下路径会被跳过：
 
 - 根目录、用户主目录以及 `/etc`、`/usr`、`/var` 等系统关键目录
 - 不存在、不是目录或任一路径组件为符号链接的路径
@@ -68,7 +70,7 @@ brew, mise, pacman, dnf, zypper, winget, vcpkg
 - 直接删除的缓存目录与当前工具配置的完整路径不一致的路径
 - 层级过浅、可能代表磁盘或应用数据根目录的路径
 
-实际删除前会再次校验路径。如果扫描不完整或发现不安全的缓存路径，命令会在执行清理前返回错误。
+实际删除前会再次校验路径。如果扫描不完整或发现不安全的缓存路径，命令会在执行清理前返回错误。原生命令仍按工具自身的规则清理缓存，其操作范围可能超出扫描时展示的路径。
 
 ---
 
@@ -91,7 +93,7 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 |------|----------|----------|------|
 | npm | `~/.npm` | `npm cache clean --force` | 包下载缓存 |
 | pnpm | `~/.local/share/pnpm/store` | `pnpm store prune` | 内容寻址存储，清理未引用包 |
-| yarn | `~/.cache/yarn` | `yarn cache clean` | Yarn 1.x 缓存目录 |
+| yarn | `$XDG_CACHE_HOME/yarn` 或 `~/.yarn/berry/cache` | `yarn cache clean` | 未设置 `XDG_CACHE_HOME` 时第一项回退到 `~/.cache/yarn` |
 | bun | `~/.bun/install/cache` | `bun pm cache rm` | Bun 包缓存 |
 | deno | `~/.cache/deno` | `deno clean` | TypeScript/JS 编译缓存和远程模块缓存 |
 
@@ -112,14 +114,14 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 | cargo | `$CARGO_HOME/{registry,git}` | 目录删除 | 未设置时回退到 `~/.cargo` |
 | go | `$GOCACHE`, `$GOMODCACHE` | `go clean -cache -modcache` | 优先读取环境变量和 `go env` |
 | maven | `$MAVEN_REPO_LOCAL` 或 `~/.m2/repository` | 目录删除 | Maven 本地依赖仓库 |
-| gradle | `~/.gradle/caches` | 目录删除 | Gradle 构建缓存 |
-| vcpkg | `/usr/local/share/vcpkg/{buildtrees,downloads,packages}` | 目录删除 | 仅清理缓存子目录，不删除安装本体 |
+| gradle | `$GRADLE_USER_HOME/caches` 或 `~/.gradle/caches` | 目录删除 | Gradle 构建缓存 |
+| vcpkg | `$VCPKG_ROOT/{buildtrees,downloads,packages}` | 目录删除 | 未设置时使用 `/usr/local/share/vcpkg`；不删除安装本体 |
 
 ### 其他语言
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
-| gem | `$GEM_HOME/cache`（回退到 `gem env home`） | 目录删除 | Ruby 下载包缓存 |
+| gem | `$GEM_HOME/cache`（回退到 `gem env home`，再回退到 `~/.gem/cache`） | 目录删除 | Ruby 下载包缓存 |
 | composer | `~/.cache/composer` | `composer clear-cache` | PHP Composer 包缓存 |
 | hex | `$HEX_HOME/packages` | 目录删除 | 未设置时回退到 `~/.hex/packages` |
 | pub | `$PUB_CACHE` | `dart pub cache clean` | 未设置时回退到 `~/.pub-cache` |
@@ -215,6 +217,10 @@ docker system prune --volumes  # 包括卷（谨慎）
 3. **mise 仅清理下载缓存**：已安装的工具版本不受影响
 4. **Docker 不纳入自动目录清理**：使用 `docker system df/prune`，避免把数据根目录误算为可回收空间
 5. **系统包管理器缓存**（apt/dnf/pacman）：删除后不影响已安装的软件
+
+### 扫描性能基准
+
+在 Linux 或 macOS 的仓库根目录执行 `scripts/benchmark-scan.sh 10000`。脚本会构建 release 版本、生成临时测试目录、计时一次扫描并清理测试目录。比较不同版本时应使用相同的文件数量和机器；该计时不纳入 CI。
 
 ---
 
