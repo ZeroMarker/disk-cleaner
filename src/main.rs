@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use cap_std::ambient_authority;
@@ -297,6 +298,20 @@ fn xdg_cache_dir(home: &Path) -> PathBuf {
 }
 
 fn command_path(cmd: &str, args: &[&str]) -> Option<PathBuf> {
+    // The same lookup is made by several callers (for example `go env` and
+    // `gem env`); each spawns a process, so remember the answers.
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+    let key = format!("{cmd} {}", args.join(" "));
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().ok()?.get(&key) {
+        return hit.clone();
+    }
+    let result = run_path_command(cmd, args);
+    cache.lock().ok()?.insert(key, result.clone());
+    result
+}
+
+fn run_path_command(cmd: &str, args: &[&str]) -> Option<PathBuf> {
     let output = Command::new(cmd).args(args).output().ok()?;
     if !output.status.success() {
         return None;
@@ -664,71 +679,99 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
     }
 }
 
+/// Scan results for one tool. Warnings are collected so that output order stays
+/// deterministic when tools are scanned on separate threads.
+#[derive(Default)]
+struct ToolScan {
+    items: Vec<JunkFile>,
+    skipped: usize,
+    cache_parents: HashMap<PathBuf, Dir>,
+    warnings: Vec<String>,
+}
+
+fn scan_tool(tool: &str) -> ToolScan {
+    let mut scan = ToolScan::default();
+    for (dir, category) in get_cache_dirs(tool) {
+        if !is_safe_cache_path(tool, &dir) {
+            if dir.exists() {
+                scan.skipped += 1;
+                scan.warnings.push(format!(
+                    "unsafe or unexpected {tool} path: {}",
+                    dir.display()
+                ));
+            }
+            continue;
+        }
+        let parent = if get_clean_cmd(tool).is_none() {
+            let Some(parent_path) = dir.parent() else {
+                scan.skipped += 1;
+                continue;
+            };
+            match Dir::open_ambient_dir(parent_path, ambient_authority()) {
+                Ok(parent)
+                    if points_to_open_dir(parent_path, &parent).unwrap_or(false)
+                        && is_safe_cache_path(tool, &dir) =>
+                {
+                    Some(parent)
+                }
+                _ => {
+                    scan.skipped += 1;
+                    scan.warnings
+                        .push(format!("changed cache parent: {}", parent_path.display()));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let size = match dir_size(&dir) {
+            Ok(size) => size,
+            Err(error) => {
+                scan.skipped += 1;
+                scan.warnings
+                    .push(format!("cannot size {}: {error}", dir.display()));
+                continue;
+            }
+        };
+        if size > 0 {
+            if let Some(parent) = parent {
+                scan.cache_parents.insert(dir.clone(), parent);
+            }
+            scan.items.push(JunkFile {
+                path: dir,
+                size,
+                category,
+                tool: Some(tool.to_string()),
+            });
+        }
+    }
+    scan
+}
+
 fn scan_cache(tools: &[String]) -> Result<ScanResult> {
+    // Tool lookups spawn subprocesses and size large directories, so scan the
+    // tools concurrently and merge in the original order.
+    let scans: Vec<ToolScan> = std::thread::scope(|scope| {
+        let handles: Vec<_> = tools
+            .iter()
+            .map(|tool| scope.spawn(|| scan_tool(tool)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("cache scan thread panicked"))
+            .collect()
+    });
+
     let mut junk = Vec::new();
     let mut skipped = 0;
     let mut cache_parents = HashMap::new();
-    for tool in tools {
-        for (dir, category) in get_cache_dirs(tool) {
-            if is_safe_cache_path(tool, &dir) {
-                let parent = if get_clean_cmd(tool).is_none() {
-                    let Some(parent_path) = dir.parent() else {
-                        skipped += 1;
-                        continue;
-                    };
-                    match Dir::open_ambient_dir(parent_path, ambient_authority()) {
-                        Ok(parent)
-                            if points_to_open_dir(parent_path, &parent).unwrap_or(false)
-                                && is_safe_cache_path(tool, &dir) =>
-                        {
-                            Some(parent)
-                        }
-                        _ => {
-                            skipped += 1;
-                            eprintln!(
-                                "  {} changed cache parent: {}",
-                                "skipped".yellow(),
-                                parent_path.display()
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-                let size = match dir_size(&dir) {
-                    Ok(size) => size,
-                    Err(error) => {
-                        skipped += 1;
-                        eprintln!(
-                            "  {} cannot size {}: {error}",
-                            "skipped".yellow(),
-                            dir.display()
-                        );
-                        continue;
-                    }
-                };
-                if size > 0 {
-                    if let Some(parent) = parent {
-                        cache_parents.insert(dir.clone(), parent);
-                    }
-                    junk.push(JunkFile {
-                        path: dir,
-                        size,
-                        category,
-                        tool: Some(tool.clone()),
-                    });
-                }
-            } else if dir.exists() {
-                skipped += 1;
-                eprintln!(
-                    "  {} unsafe or unexpected {} path: {}",
-                    "skipped".yellow(),
-                    tool,
-                    dir.display()
-                );
-            }
+    for scan in scans {
+        for warning in &scan.warnings {
+            eprintln!("  {} {warning}", "skipped".yellow());
         }
+        skipped += scan.skipped;
+        junk.extend(scan.items);
+        cache_parents.extend(scan.cache_parents);
     }
     junk.sort_by_key(|item| std::cmp::Reverse(item.size));
     Ok(ScanResult {

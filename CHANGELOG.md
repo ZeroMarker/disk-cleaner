@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `cache` 并行扫描各工具，并缓存重复的外部命令查询结果（本机 `cache --dry-run` 约 1.4s → 0.4s，输出不变）
 - 大小统计按 inode 去重硬链接文件（pnpm/npm 存储），避免高估
 - `journalctl` 清理会删除系统日志，现在默认的全部工具扫描会跳过它，须显式使用 `--tool journalctl`
 - `cache` 在未设置 `HOME`/`USERPROFILE` 时报错，不再回退到当前目录
