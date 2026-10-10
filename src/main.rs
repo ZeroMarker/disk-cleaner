@@ -11,6 +11,10 @@ use colored::Colorize;
 use same_file::Handle;
 use walkdir::WalkDir;
 
+/// Supported tools that delete data other than disposable caches. They are
+/// only processed when named with `--tool`, never in the default all-tools scan.
+const EXPLICIT_ONLY_TOOLS: &[&str] = &["journalctl"];
+
 const SUPPORTED_TOOLS: &[&str] = &[
     "uv",
     "npm",
@@ -93,7 +97,7 @@ enum Commands {
         after_help = "Examples:\n  disk-cleaner cache --dry-run\n  disk-cleaner cache --tool npm --dry-run\n  disk-cleaner cache --tool cargo\n\nSupported tools include: uv, npm, pnpm, yarn, bun, deno, cargo, go, pip, poetry, conda, pdm, gem, composer, maven, gradle, hex, pub, nuget, apt, snap, brew, mise, pacman, dnf, zypper, winget, and vcpkg."
     )]
     Cache {
-        /// Only clean this tool's cache; omit to scan all supported tools.
+        /// Only clean this tool's cache; omit to scan all supported tools except journalctl, which must be named explicitly.
         #[arg(short, long, value_name = "TOOL")]
         tool: Option<String>,
         /// Show what would be cleaned without changing anything.
@@ -122,9 +126,12 @@ fn is_junk(path: &Path, is_dir: bool, is_file: bool, include_files: bool) -> Opt
     // not follow symlinks, so links cannot become cleanup targets.
     if is_dir {
         match name {
-            "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".gradle" => {
+            "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" => {
                 return Some("cache/build");
             }
+            // The user-level Gradle home holds wrapper distributions and
+            // configuration, so only project-level .gradle directories match.
+            ".gradle" if !is_home_dir(path.parent()) => return Some("cache/build"),
             "target"
                 if path
                     .parent()
@@ -154,12 +161,34 @@ fn is_junk(path: &Path, is_dir: bool, is_file: bool, include_files: bool) -> Opt
     }
 }
 
+fn is_home_dir(path: Option<&Path>) -> bool {
+    let (Some(path), Some(home)) = (path, home_dir_opt()) else {
+        return false;
+    };
+    match (path.canonicalize(), home.canonicalize()) {
+        (Ok(path), Ok(home)) => path == home,
+        _ => false,
+    }
+}
+
 fn dir_size(path: &Path) -> Result<u64> {
     let mut size = 0;
+    // Hard-linked files (common in pnpm and npm stores) share storage, so
+    // count each inode once.
+    #[cfg(unix)]
+    let mut seen = std::collections::HashSet::new();
     for entry in WalkDir::new(path) {
         let entry = entry?;
         if entry.file_type().is_file() {
-            size += entry.metadata()?.len();
+            let metadata = entry.metadata()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 && !seen.insert((metadata.dev(), metadata.ino())) {
+                    continue;
+                }
+            }
+            size += metadata.len();
         }
     }
     Ok(size)
@@ -247,15 +276,14 @@ fn has_symlink_parent(root: &Dir, relative: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn home_dir() -> PathBuf {
-    dirs_or_home()
+fn home_dir_opt() -> Option<PathBuf> {
+    env_path("HOME").or_else(|| env_path("USERPROFILE"))
 }
 
-fn dirs_or_home() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+fn home_dir() -> PathBuf {
+    // `cache` refuses to run without a home directory, so the fallback is
+    // only reached by helpers called outside that command.
+    home_dir_opt().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -422,6 +450,15 @@ fn is_safe_cache_path(tool: &str, path: &Path) -> bool {
         || canonical.components().count() >= 4
 }
 
+/// Returns the cache candidate list for a single path, empty when it is absent.
+fn existing(path: PathBuf, label: &str) -> Vec<(PathBuf, String)> {
+    if path.exists() {
+        vec![(path, label.into())]
+    } else {
+        vec![]
+    }
+}
+
 fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
     let home = home_dir();
     let xdg_cache = xdg_cache_dir(&home);
@@ -430,21 +467,13 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             let cache = env_path("UV_CACHE_DIR")
                 .or_else(|| command_path("uv", &["cache", "dir"]))
                 .unwrap_or_else(|| xdg_cache.join("uv"));
-            if cache.exists() {
-                vec![(cache, "uv cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "uv cache")
         }
         "npm" => {
             let cache = env_path("NPM_CONFIG_CACHE")
                 .or_else(|| command_path("npm", &["config", "get", "cache"]))
                 .unwrap_or_else(|| home.join(".npm"));
-            if cache.exists() {
-                vec![(cache, "npm cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "npm cache")
         }
         "cargo" => {
             let cargo_home = env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
@@ -461,11 +490,7 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
         }
         "journalctl" => {
             let log_dir = PathBuf::from("/var/log/journal");
-            if log_dir.exists() {
-                vec![(log_dir, "journalctl".into())]
-            } else {
-                vec![]
-            }
+            existing(log_dir, "journalctl")
         }
         "apt" => {
             let archives = PathBuf::from("/var/cache/apt/archives");
@@ -489,19 +514,11 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 return vec![];
             };
             let cache = local.join("Temp").join("WinGet");
-            if cache.exists() {
-                vec![(cache, "winget cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "winget cache")
         }
         "mise" => {
             let cache = env_path("MISE_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("mise"));
-            if cache.exists() {
-                vec![(cache, "mise cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "mise cache")
         }
         "brew" => {
             let mut dirs = Vec::new();
@@ -521,37 +538,21 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
             let cache = env_path("PIP_CACHE_DIR")
                 .or_else(|| command_path("pip", &["cache", "dir"]))
                 .unwrap_or_else(|| xdg_cache.join("pip"));
-            if cache.exists() {
-                vec![(cache, "pip cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "pip cache")
         }
         "poetry" => {
             let cache = env_path("POETRY_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pypoetry"));
-            if cache.exists() {
-                vec![(cache, "poetry cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "poetry cache")
         }
         "conda" => {
             let cache = env_path("CONDA_PKGS_DIRS")
                 .and_then(|p| std::env::split_paths(&p).next())
                 .unwrap_or_else(|| home.join(".conda").join("pkgs"));
-            if cache.exists() {
-                vec![(cache, "conda pkgs".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "conda pkgs")
         }
         "pdm" => {
             let cache = env_path("PDM_CACHE_DIR").unwrap_or_else(|| xdg_cache.join("pdm"));
-            if cache.exists() {
-                vec![(cache, "pdm cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "pdm cache")
         }
         "go" => {
             let gopath = env_path("GOPATH")
@@ -577,38 +578,23 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 .or_else(|| command_path("gem", &["env", "home"]))
                 .unwrap_or_else(|| home.join(".gem"))
                 .join("cache");
-            if cache.exists() {
-                vec![(cache, "gem cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "gem cache")
         }
         "maven" => {
             let cache =
                 env_path("MAVEN_REPO_LOCAL").unwrap_or_else(|| home.join(".m2").join("repository"));
-            if cache.exists() {
-                vec![(cache, "maven dependency cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "maven dependency cache")
         }
         "gradle" => {
             let cache = env_path("GRADLE_USER_HOME")
                 .unwrap_or_else(|| home.join(".gradle"))
                 .join("caches");
-            if cache.exists() {
-                vec![(cache, "gradle caches".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "gradle caches")
         }
         "pnpm" => {
-            let store = home.join(".local").join("share").join("pnpm").join("store");
-            if store.exists() {
-                vec![(store, "pnpm store".into())]
-            } else {
-                vec![]
-            }
+            let data_home = env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
+            let store = data_home.join("pnpm").join("store");
+            existing(store, "pnpm store")
         }
         "yarn" => {
             let candidates = [xdg_cache.join("yarn"), home.join(".yarn/berry/cache")];
@@ -619,57 +605,36 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
                 .collect()
         }
         "bun" => {
-            let cache = home.join(".bun").join("install").join("cache");
-            if cache.exists() {
-                vec![(cache, "bun cache".into())]
-            } else {
-                vec![]
-            }
+            let cache = env_path("BUN_INSTALL")
+                .unwrap_or_else(|| home.join(".bun"))
+                .join("install")
+                .join("cache");
+            existing(cache, "bun cache")
         }
         "deno" => {
             let cache = env_path("DENO_DIR").unwrap_or_else(|| xdg_cache.join("deno"));
-            if cache.exists() {
-                vec![(cache, "deno cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "deno cache")
         }
         "composer" => {
             let cache = env_path("COMPOSER_CACHE_DIR")
                 .or_else(|| command_path("composer", &["config", "cache-dir", "--global"]))
                 .unwrap_or_else(|| xdg_cache.join("composer"));
-            if cache.exists() {
-                vec![(cache, "composer cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "composer cache")
         }
         "hex" => {
             let cache = env_path("HEX_HOME")
                 .unwrap_or_else(|| home.join(".hex"))
                 .join("packages");
-            if cache.exists() {
-                vec![(cache, "hex cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "hex cache")
         }
         "pub" => {
             let cache = env_path("PUB_CACHE").unwrap_or_else(|| home.join(".pub-cache"));
-            if cache.exists() {
-                vec![(cache, "pub cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "pub cache")
         }
         "nuget" => {
             let cache =
                 env_path("NUGET_PACKAGES").unwrap_or_else(|| home.join(".nuget").join("packages"));
-            if cache.exists() {
-                vec![(cache, "nuget packages".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "nuget packages")
         }
         "vcpkg" => {
             let root =
@@ -685,27 +650,15 @@ fn get_cache_dirs(tool: &str) -> Vec<(PathBuf, String)> {
         }
         "zypper" => {
             let cache = PathBuf::from("/var/cache/zypp");
-            if cache.exists() {
-                vec![(cache, "zypper cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "zypper cache")
         }
         "dnf" => {
             let cache = PathBuf::from("/var/cache/dnf");
-            if cache.exists() {
-                vec![(cache, "dnf cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "dnf cache")
         }
         "pacman" => {
             let cache = PathBuf::from("/var/cache/pacman/pkg");
-            if cache.exists() {
-                vec![(cache, "pacman cache".into())]
-            } else {
-                vec![]
-            }
+            existing(cache, "pacman cache")
         }
         _ => vec![],
     }
@@ -862,14 +815,8 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
         Err(error) => return Err(error.into()),
     };
     if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stderr);
-        if out.is_empty() {
-            let out = String::from_utf8_lossy(&output.stdout);
-            for line in out.lines() {
-                println!("  {}", line.dimmed());
-            }
-        } else {
-            for line in out.lines() {
+        for stream in [&output.stdout, &output.stderr] {
+            for line in String::from_utf8_lossy(stream).lines() {
                 println!("  {}", line.dimmed());
             }
         }
@@ -1243,7 +1190,8 @@ fn main() -> Result<()> {
                     "\n{} This will permanently delete the files listed above.",
                     "Warning!".red().bold()
                 );
-                println!("Proceed? [y/N] ");
+                print!("Proceed? [y/N] ");
+                std::io::Write::flush(&mut std::io::stdout())?;
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if !input.trim().eq_ignore_ascii_case("y") {
@@ -1263,6 +1211,9 @@ fn main() -> Result<()> {
             )?;
         }
         Commands::Cache { tool, dry_run } => {
+            if home_dir_opt().is_none() {
+                anyhow::bail!("cannot locate the home directory: set HOME (or USERPROFILE)");
+            }
             let tools = match tool {
                 Some(t) if SUPPORTED_TOOLS.contains(&t.as_str()) => vec![t],
                 Some(t) if matches!(t.as_str(), "docker" | "flatpak") => {
@@ -1274,7 +1225,11 @@ fn main() -> Result<()> {
                     "unsupported tool '{t}'; supported tools: {}",
                     SUPPORTED_TOOLS.join(", ")
                 ),
-                None => SUPPORTED_TOOLS.iter().map(|tool| (*tool).into()).collect(),
+                None => SUPPORTED_TOOLS
+                    .iter()
+                    .filter(|tool| !EXPLICIT_ONLY_TOOLS.contains(tool))
+                    .map(|tool| (*tool).into())
+                    .collect(),
             };
 
             println!(
@@ -1300,7 +1255,8 @@ fn main() -> Result<()> {
                     "\n{} This will run native cleanup commands for the listed tools or delete the listed directories. Native commands may clean additional caches managed by those tools.",
                     "Warning!".red().bold()
                 );
-                println!("Proceed? [y/N] ");
+                print!("Proceed? [y/N] ");
+                std::io::Write::flush(&mut std::io::stdout())?;
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if !input.trim().eq_ignore_ascii_case("y") {
@@ -1600,5 +1556,43 @@ mod tests {
             "cargo",
             Path::new("/home/user/.cargo/git")
         ));
+    }
+
+    #[test]
+    fn project_gradle_dir_matches_but_home_gradle_does_not() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("disk-cleaner-gradle-test-{}", std::process::id()));
+        fs::create_dir_all(base.join(".gradle")).unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+
+        assert_eq!(
+            is_junk(&base.join(".gradle"), true, false, false),
+            Some("cache/build")
+        );
+        assert_eq!(is_junk(&home.join(".gradle"), true, false, false), None);
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn journalctl_is_explicit_only() {
+        assert!(SUPPORTED_TOOLS.contains(&"journalctl"));
+        assert!(EXPLICIT_ONLY_TOOLS.contains(&"journalctl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_files_are_counted_once() {
+        let root =
+            std::env::temp_dir().join(format!("disk-cleaner-hardlink-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.bin"), vec![0u8; 100]).unwrap();
+        fs::hard_link(root.join("a.bin"), root.join("b.bin")).unwrap();
+
+        assert_eq!(dir_size(&root).unwrap(), 100);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

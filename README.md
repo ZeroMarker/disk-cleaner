@@ -79,7 +79,9 @@ Cache cleanup uses native commands where defined. Directory deletion is used onl
 | **System** | apt, dnf, zypper, brew | native command |
 | **System** | pacman, snap, winget | directory |
 | **Runtime** | mise | native command |
-| **Logs** | journalctl | native command |
+| **Logs** | journalctl (explicit `--tool journalctl` only) | native command |
+
+`journalctl` vacuums system logs rather than a cache, so it is skipped by `cache` without `--tool` and must be requested with `--tool journalctl`. `cache` also requires `HOME` (or `USERPROFILE`) to be set. `pnpm` honours `XDG_DATA_HOME` and `bun` honours `BUN_INSTALL`.
 
 Docker and Flatpak are not supported by `cache`; use their own tools for manual cleanup.
 
@@ -87,7 +89,7 @@ Docker and Flatpak are not supported by `cache`; use their own tools for manual 
 
 | Category     | Examples                                  |
 |-------------|-------------------------------------------|
-| cache/build | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`, Rust `target` beside `Cargo.toml` |
+| cache/build | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle` (project directories only; `~/.gradle` is never matched), Rust `target` beside `Cargo.toml` |
 | system      | `.DS_Store`, `Thumbs.db`, `desktop.ini`   |
 | temp/log (opt-in) | `*.tmp`, `*.bak`, `*.log`, `*.swp`        |
 
@@ -99,7 +101,7 @@ Docker and Flatpak are not supported by `cache`; use their own tools for manual 
 
 Directory cleanup and direct cache deletion use paths relative to directories opened during the scan. A replaced scan root or symlinked parent is rejected before directory cleanup. Directly deleted caches must match the tool's configured full path; cache paths containing symlinks are rejected. Native cleanup commands may affect caches outside the listed paths, so review the command shown by `cache --dry-run` before confirming.
 
-All sizes are estimates based on file lengths, not measured free disk space. For direct deletion, the result uses the size measured before cleanup. For native commands, it uses the decrease in size of matched paths after the command; the command may clean more or less elsewhere.
+All sizes are estimates based on file lengths (hard-linked files are counted once on Unix), not measured free disk space. For direct deletion, the result uses the size measured before cleanup. For native commands, it uses the decrease in size of matched paths after the command; the command may clean more or less elsewhere.
 
 ## Scan Benchmark
 

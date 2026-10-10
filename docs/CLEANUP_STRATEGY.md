@@ -18,7 +18,7 @@
 
 | 类别 | 匹配方式 | 目标 |
 |------|----------|------|
-| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`；`target` 仅在父目录有 `Cargo.toml` 时匹配 |
+| cache/build | 目录名精确匹配 | `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.gradle`（不含用户主目录下的 `~/.gradle`）；`target` 仅在父目录有 `Cargo.toml` 时匹配 |
 | system | 文件名精确匹配 | `.DS_Store`, `Thumbs.db`, `desktop.ini` |
 | temp/log | 使用 `--include-files` 时按扩展名匹配 | `*.tmp`, `*.temp`, `*.swp`, `*.swo`, `*.bak`, `*.log` |
 
@@ -92,9 +92,9 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
 | npm | `~/.npm` | `npm cache clean --force` | 包下载缓存 |
-| pnpm | `~/.local/share/pnpm/store` | `pnpm store prune` | 内容寻址存储，清理未引用包 |
+| pnpm | `$XDG_DATA_HOME/pnpm/store`（未设置时 `~/.local/share/pnpm/store`） | `pnpm store prune` | 内容寻址存储，清理未引用包 |
 | yarn | `$XDG_CACHE_HOME/yarn` 或 `~/.yarn/berry/cache` | `yarn cache clean` | 未设置 `XDG_CACHE_HOME` 时第一项回退到 `~/.cache/yarn` |
-| bun | `~/.bun/install/cache` | `bun pm cache rm` | Bun 包缓存 |
+| bun | `$BUN_INSTALL/install/cache`（未设置时 `~/.bun/install/cache`） | `bun pm cache rm` | Bun 包缓存 |
 | deno | `~/.cache/deno` | `deno clean` | TypeScript/JS 编译缓存和远程模块缓存 |
 
 ### Python 生态
@@ -151,7 +151,7 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 
 | 工具 | 缓存路径 | 清理命令 | 说明 |
 |------|----------|----------|------|
-| journalctl | `/var/log/journal` | `journalctl --vacuum-time=3d` | 保留最近 3 天日志，需 sudo 权限 |
+| journalctl | `/var/log/journal` | `journalctl --vacuum-time=3d` | 保留最近 3 天日志，需 sudo 权限；会删除日志而非缓存，仅在显式 `--tool journalctl` 时处理 |
 
 ---
 
