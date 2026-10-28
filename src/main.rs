@@ -1490,6 +1490,8 @@ mod tests {
 
         assert!(clean(&items, false, true, &opened, &root).is_err());
         assert!(!removable.exists());
+        // Windows cannot remove a directory while a handle to it is open.
+        drop(opened);
         fs::remove_dir(root).unwrap();
     }
 
@@ -1684,7 +1686,8 @@ mod tests {
             .unwrap()
             .join(format!("disk-cleaner-gradle-test-{}", std::process::id()));
         fs::create_dir_all(base.join(".gradle")).unwrap();
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        // HOME is not set on Windows; use the same lookup as the program.
+        let home = home_dir_opt().unwrap();
 
         assert_eq!(
             is_junk(&base.join(".gradle"), true, false, false),
