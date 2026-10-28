@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 默认的 `cache` 全部工具扫描遇到普通用户无法读取的系统缓存（apt、snap、pacman、dnf、zypper）时列为未包含并继续，不再取消整次清理；显式 `--tool` 仍严格检查
+- 修复 brew 清理命令：`brew cleanup --cache` 是无效选项，改为 `brew cleanup --prune=all`
+- 修复 pub 清理会等待确认：改为 `dart pub cache clean --force`
+- 原生命令不再继承标准输入，需要确认的命令直接失败而不是在隐藏提示处挂起
 - `cache` 并行扫描各工具，并缓存重复的外部命令查询结果（本机 `cache --dry-run` 约 1.4s → 0.4s，输出不变）
 - 大小统计按 inode 去重硬链接文件（pnpm/npm 存储），避免高估
 - `journalctl` 清理会删除系统日志，现在默认的全部工具扫描会跳过它，须显式使用 `--tool journalctl`

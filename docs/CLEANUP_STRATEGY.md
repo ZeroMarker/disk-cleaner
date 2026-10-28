@@ -124,7 +124,7 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 | gem | `$GEM_HOME/cache`（回退到 `gem env home`，再回退到 `~/.gem/cache`） | 目录删除 | Ruby 下载包缓存 |
 | composer | `~/.cache/composer` | `composer clear-cache` | PHP Composer 包缓存 |
 | hex | `$HEX_HOME/packages` | 目录删除 | 未设置时回退到 `~/.hex/packages` |
-| pub | `$PUB_CACHE` | `dart pub cache clean` | 未设置时回退到 `~/.pub-cache` |
+| pub | `$PUB_CACHE` | `dart pub cache clean --force` | 未设置时回退到 `~/.pub-cache` |
 | nuget | `$NUGET_PACKAGES` | `dotnet nuget locals all --clear` | 未设置时回退到 `~/.nuget/packages` |
 
 ### 系统包管理器
@@ -137,7 +137,7 @@ Docker 和 Flatpak 不自动清理，需使用各自工具手动管理。
 | zypper | `/var/cache/zypp` | `zypper clean` | openSUSE 包缓存 |
 | snap | `/var/lib/snapd/cache` | 目录删除 | Snap 缓存 |
 | flatpak | 不进行目录扫描 | 不自动清理 | 未使用运行时不是缓存目录，避免错误估算 |
-| brew | `brew --cache` 返回的目录 | `brew cleanup --cache` | Homebrew 下载缓存 |
+| brew | `brew --cache` 返回的目录 | `brew cleanup --prune=all` | Homebrew 下载缓存 |
 | winget | `%LOCALAPPDATA%/Temp/WinGet` | 目录删除 | WinGet 临时下载缓存；不删除便携包安装目录 |
 
 ### 运行时与容器

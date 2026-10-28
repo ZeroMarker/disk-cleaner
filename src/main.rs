@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
@@ -15,6 +15,11 @@ use walkdir::WalkDir;
 /// Supported tools that delete data other than disposable caches. They are
 /// only processed when named with `--tool`, never in the default all-tools scan.
 const EXPLICIT_ONLY_TOOLS: &[&str] = &["journalctl"];
+
+/// Tools whose caches are system directories normally readable only by root.
+/// In the default all-tools scan an unreadable one is reported and left alone,
+/// so a non-root run is not cancelled; naming the tool keeps the strict check.
+const SYSTEM_TOOLS: &[&str] = &["apt", "snap", "pacman", "dnf", "zypper", "journalctl"];
 
 const SUPPORTED_TOOLS: &[&str] = &[
     "uv",
@@ -687,9 +692,21 @@ struct ToolScan {
     skipped: usize,
     cache_parents: HashMap<PathBuf, Dir>,
     warnings: Vec<String>,
+    notes: Vec<String>,
 }
 
-fn scan_tool(tool: &str) -> ToolScan {
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let io = cause.downcast_ref::<std::io::Error>().or_else(|| {
+            cause
+                .downcast_ref::<walkdir::Error>()
+                .and_then(walkdir::Error::io_error)
+        });
+        io.is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+fn scan_tool(tool: &str, explicit: bool) -> ToolScan {
     let mut scan = ToolScan::default();
     for (dir, category) in get_cache_dirs(tool) {
         if !is_safe_cache_path(tool, &dir) {
@@ -726,6 +743,15 @@ fn scan_tool(tool: &str) -> ToolScan {
         };
         let size = match dir_size(&dir) {
             Ok(size) => size,
+            Err(error)
+                if !explicit && SYSTEM_TOOLS.contains(&tool) && is_permission_denied(&error) =>
+            {
+                scan.notes.push(format!(
+                    "{} needs root; run 'sudo disk-cleaner cache --tool {tool}' to include it",
+                    dir.display()
+                ));
+                continue;
+            }
             Err(error) => {
                 scan.skipped += 1;
                 scan.warnings
@@ -748,13 +774,13 @@ fn scan_tool(tool: &str) -> ToolScan {
     scan
 }
 
-fn scan_cache(tools: &[String]) -> Result<ScanResult> {
+fn scan_cache(tools: &[String], explicit: bool) -> Result<ScanResult> {
     // Tool lookups spawn subprocesses and size large directories, so scan the
     // tools concurrently and merge in the original order.
     let scans: Vec<ToolScan> = std::thread::scope(|scope| {
         let handles: Vec<_> = tools
             .iter()
-            .map(|tool| scope.spawn(|| scan_tool(tool)))
+            .map(|tool| scope.spawn(move || scan_tool(tool, explicit)))
             .collect();
         handles
             .into_iter()
@@ -768,6 +794,9 @@ fn scan_cache(tools: &[String]) -> Result<ScanResult> {
     for scan in scans {
         for warning in &scan.warnings {
             eprintln!("  {} {warning}", "skipped".yellow());
+        }
+        for note in &scan.notes {
+            eprintln!("  {} {note}", "not included".dimmed());
         }
         skipped += scan.skipped;
         junk.extend(scan.items);
@@ -794,10 +823,11 @@ fn get_clean_cmd(tool: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "conda" => Some(("conda", vec!["clean", "--all", "-y"])),
         "pdm" => Some(("pdm", vec!["cache", "clear"])),
         "composer" => Some(("composer", vec!["clear-cache"])),
-        "pub" => Some(("dart", vec!["pub", "cache", "clean"])),
+        // Without --force the command waits for a confirmation answer.
+        "pub" => Some(("dart", vec!["pub", "cache", "clean", "--force"])),
         "nuget" => Some(("dotnet", vec!["nuget", "locals", "all", "--clear"])),
         "apt" => Some(("apt-get", vec!["clean"])),
-        "brew" => Some(("brew", vec!["cleanup", "--cache"])),
+        "brew" => Some(("brew", vec!["cleanup", "--prune=all"])),
         "mise" => Some(("mise", vec!["cache", "clear"])),
         "dnf" => Some(("dnf", vec!["clean", "all"])),
         "zypper" => Some(("zypper", vec!["clean"])),
@@ -849,7 +879,9 @@ fn run_clean_cmd(tool: &str, dry_run: bool) -> Result<CleanCommandResult> {
         println!("  {} {} {}", "[dry-run]".yellow(), cmd, args.join(" "));
         return Ok(CleanCommandResult::Success);
     }
-    let output = match Command::new(cmd).args(&args).output() {
+    // Output is captured, so a prompt would be invisible; give commands no
+    // stdin so one that asks for confirmation fails instead of hanging.
+    let output = match Command::new(cmd).args(&args).stdin(Stdio::null()).output() {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             println!("  {} command not found: {cmd}", "skipped".yellow());
@@ -1257,6 +1289,7 @@ fn main() -> Result<()> {
             if home_dir_opt().is_none() {
                 anyhow::bail!("cannot locate the home directory: set HOME (or USERPROFILE)");
             }
+            let explicit = tool.is_some();
             let tools = match tool {
                 Some(t) if SUPPORTED_TOOLS.contains(&t.as_str()) => vec![t],
                 Some(t) if matches!(t.as_str(), "docker" | "flatpak") => {
@@ -1280,7 +1313,7 @@ fn main() -> Result<()> {
                 "Scanning caches for:".bold().cyan(),
                 tools.join(", ")
             );
-            let result = scan_cache(&tools)?;
+            let result = scan_cache(&tools, explicit)?;
             if result.items.is_empty() && result.skipped == 0 {
                 println!("{}", "No caches found.".green());
                 return Ok(());
@@ -1333,6 +1366,49 @@ mod tests {
     #[test]
     fn apt_uses_the_matching_archive_cleanup_command() {
         assert_eq!(get_clean_cmd("apt"), Some(("apt-get", vec!["clean"])));
+    }
+
+    #[test]
+    fn native_commands_use_valid_non_interactive_arguments() {
+        assert_eq!(
+            get_clean_cmd("brew"),
+            Some(("brew", vec!["cleanup", "--prune=all"]))
+        );
+        assert_eq!(
+            get_clean_cmd("pub"),
+            Some(("dart", vec!["pub", "cache", "clean", "--force"]))
+        );
+    }
+
+    #[test]
+    fn system_tools_are_supported() {
+        for tool in SYSTEM_TOOLS {
+            assert!(SUPPORTED_TOOLS.contains(tool));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_reported_as_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "disk-cleaner-permission-test-{}",
+            std::process::id()
+        ));
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("file"), b"data").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = dir_size(&root);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        // root can read the directory regardless of its mode.
+        if let Err(error) = result {
+            assert!(is_permission_denied(&error));
+        }
+        assert!(!is_permission_denied(&anyhow::anyhow!("other failure")));
     }
 
     #[test]

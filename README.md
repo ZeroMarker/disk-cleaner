@@ -81,7 +81,7 @@ Cache cleanup uses native commands where defined. Directory deletion is used onl
 | **Runtime** | mise | native command |
 | **Logs** | journalctl (explicit `--tool journalctl` only) | native command |
 
-`journalctl` vacuums system logs rather than a cache, so it is skipped by `cache` without `--tool` and must be requested with `--tool journalctl`. `cache` also requires `HOME` (or `USERPROFILE`) to be set. `pnpm` honours `XDG_DATA_HOME` and `bun` honours `BUN_INSTALL`.
+`journalctl` vacuums system logs rather than a cache, so it is skipped by `cache` without `--tool` and must be requested with `--tool journalctl`. System caches owned by root (apt, snap, pacman, dnf, zypper) that the current user cannot read are listed as not included in the default scan instead of cancelling it; clean them with, for example, `sudo disk-cleaner cache --tool apt`. When a tool is named with `--tool`, an unreadable cache still cancels cleanup. Native commands run without standard input, so a command that asks for confirmation fails rather than waiting. `cache` also requires `HOME` (or `USERPROFILE`) to be set. `pnpm` honours `XDG_DATA_HOME` and `bun` honours `BUN_INSTALL`.
 
 Docker and Flatpak are not supported by `cache`; use their own tools for manual cleanup.
 
